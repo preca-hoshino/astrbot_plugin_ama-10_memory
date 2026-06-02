@@ -1,5 +1,5 @@
 """
-BM25检索器 - 基于SQLite FTS5 或 PostgreSQL tsvector 的稀疏检索
+BM25检索器 - 基于 PostgreSQL tsvector 的稀疏检索
 实现简洁的BM25检索功能,用于MemoryEngine的混合检索
 """
 
@@ -27,7 +27,7 @@ class BM25Retriever:
     """
     文档路 BM25 关键词检索器
 
-    使用SQLite FTS5或PostgreSQL tsvector实现BM25算法的全文检索。
+    使用 PostgreSQL tsvector 实现 BM25 全文检索。
     主要特性:
     1. 使用TextProcessor进行中文分词和停用词过滤
     2. 支持通过metadata过滤session_id和persona_id
@@ -44,7 +44,7 @@ class BM25Retriever:
         初始化BM25检索器
 
         Args:
-            db_path: SQLite数据库路径
+            db_path: 未使用（保留参数兼容性）
             text_processor: 文本处理器实例
             config: 配置字典(可选)
         """

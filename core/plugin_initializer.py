@@ -9,7 +9,6 @@ from pathlib import Path
 
 from astrbot.api import logger
 from astrbot.api.star import Context
-from astrbot.core.db.vec_db.base import BaseVecDB
 from astrbot.core.provider.provider import EmbeddingProvider, Provider
 
 from ..storage.conversation_store import ConversationStore
@@ -40,8 +39,8 @@ class PluginInitializer:
         # 组件实例
         self.embedding_provider: EmbeddingProvider | None = None
         self.llm_provider: Provider | None = None
-        self.db: BaseVecDB | None = None
-        self.graph_db: BaseVecDB | None = None
+        self.vec_db = None
+        self.graph_vec_db = None
         self.memory_engine: MemoryEngine | None = None
         self.memory_processor: MemoryProcessor | None = None
         self.conversation_manager: ConversationManager | None = None
@@ -293,7 +292,6 @@ class PluginInitializer:
         try:
             # 初始化数据库
             data_dir_path = Path(self.data_dir)
-            db_path = data_dir_path / "ama_10_memory.db"
             graph_memory_enabled = self.config_manager.get("graph_memory.enabled", True)
 
             logger.debug(f"[Initializer] data_dir={self.data_dir}, graph_enabled={graph_memory_enabled}")
@@ -321,16 +319,16 @@ class PluginInitializer:
             _get_emb = lambda: self.embedding_provider
 
             logger.info(f"[Initializer] 创建 PgVecDB (documents_vec, dim={self.embedding_provider.get_dim()})")
-            self.db = PgVecDB(
+            self.vec_db = PgVecDB(
                 vec_table="documents_vec",
                 doc_table="documents",
                 dimension=self.embedding_provider.get_dim(),
                 embedding_provider=self.embedding_provider,
                 provider_getter=_get_emb,
             )
-            self.graph_db = None
+            self.graph_vec_db = None
             if graph_memory_enabled:
-                self.graph_db = PgVecDB(
+                self.graph_vec_db = PgVecDB(
                     vec_table="graph_documents_vec",
                     doc_table="graph_documents",
                     dimension=self.embedding_provider.get_dim(),
@@ -414,9 +412,8 @@ class PluginInitializer:
             }
 
             self.memory_engine = MemoryEngine(
-                db_path=str(db_path),
-                faiss_db=self.db,
-                graph_vector_db=self.graph_db,
+                vec_db=self.vec_db,
+                graph_vector_db=self.graph_vec_db,
                 llm_provider=self.llm_provider,
                 config=memory_engine_config,
             )
@@ -490,7 +487,7 @@ class PluginInitializer:
             logger.info(f"[Initializer] 组件状态: memory_engine={self.memory_engine is not None}, "
                         f"memory_processor={self.memory_processor is not None}, "
                         f"conversation_manager={self.conversation_manager is not None}, "
-                        f"graph_db={self.graph_db is not None}, "
+                        f"graph_vec_db={self.graph_vec_db is not None}, "
                         f"decay_scheduler={self.decay_scheduler is not None}")
 
         except Exception as e:

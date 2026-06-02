@@ -278,7 +278,7 @@ class DecayScheduler:
             f"执行时间: {self.check_hour:02d}:{self.check_minute:02d})"
         )
 
-        # 延迟 30 秒执行首次检查，避免与启动任务争抢 SQLite 写锁
+        # 延迟 30 秒执行首次检查，避免与启动任务争抢数据库连接
         async def _delayed_first_check():
             await asyncio.sleep(30)
             if self._running:

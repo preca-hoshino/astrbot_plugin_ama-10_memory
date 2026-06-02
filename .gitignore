@@ -14,7 +14,6 @@ venv/
 *.db
 *.index
 *.faiss
-storage/
 .idea/
 .vscode/
 *.swp

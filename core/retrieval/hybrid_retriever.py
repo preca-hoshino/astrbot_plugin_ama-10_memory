@@ -456,10 +456,10 @@ class HybridRetriever:
         ID体系说明：
         - doc_id (int): documents表的主键，统一标识符
         - 三个存储层都使用这个整数ID进行关联
-        - FAISS内部使用UUID，但对外接口使用整数ID
+        - 向量库内部使用UUID，但对外接口使用整数ID
 
         更新策略：
-        1. FAISS向量库（通过vector_retriever，会更新DocumentStorage）
+        1. 向量库（通过vector_retriever，会更新DocumentStorage）
         2. documents表无需额外更新（已在步骤1完成）
         3. BM25索引不存储metadata，从documents表读取
 
@@ -471,13 +471,13 @@ class HybridRetriever:
             bool: 是否更新成功
         """
         try:
-            # 更新FAISS向量库（这会同步更新DocumentStorage中的metadata）
+            # 更新向量库（这会同步更新DocumentStorage中的metadata）
             vector_success = await self.vector_retriever.update_metadata(
                 doc_id, metadata
             )
 
             if not vector_success:
-                logger.error(f"[同步更新] FAISS更新失败 (doc_id={doc_id})")
+                logger.error(f"[同步更新] 向量更新失败 (doc_id={doc_id})")
                 return False
 
             logger.info(f"[同步更新] 元数据更新成功 (doc_id={doc_id})")

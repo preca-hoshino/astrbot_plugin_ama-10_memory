@@ -6,7 +6,6 @@
 import asyncio
 import json
 import time
-from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
@@ -44,20 +43,14 @@ class MemoryEngine:
     ==================
     本系统使用三层存储架构，统一使用整数ID作为主键：
 
-    1. **DocumentStorage (FAISS内部)**
-       - 表: documents (SQLite，由SQLAlchemy管理)
-       - 主键: id (INTEGER, AUTOINCREMENT) - 这是统一的整数标识符
-       - UUID字段: doc_id (TEXT) - FAISS内部使用的UUID字符串
-       - 关系: id ←→ doc_id (一对一映射)
+    1. **PgVecDB (向量存储)**
+       - 表: documents (PostgreSQL)
+       - 向量索引: documents_vec (pgvector)
+       - 主键: id (INTEGER, BIGSERIAL)
 
-    2. **BM25 FTS5索引**
-       - 表: ama_10_memories_fts (SQLite FTS5虚拟表)
-       - 字段: doc_id (UNINDEXED) - 引用documents.id的整数
-       - 注意: 只存储分词后的内容，metadata从documents表读取
-
-    3. **FAISS向量索引**
-       - 存储: EmbeddingStorage (FAISS索引文件)
-       - 索引ID: 使用documents.id作为向量的整数索引
+    2. **BM25 索引**
+       - 表: ama_10_memories_fts (PostgreSQL tsvector)
+       - 由触发器自动更新 tsv 列
 
     插件对外接口：
     - add_memory() 返回: int (documents.id)
@@ -66,15 +59,14 @@ class MemoryEngine:
     - delete_memory(memory_id: int) 参数: documents.id
 
     同步保证：
-    - 添加: 先插入DocumentStorage获取id，再用此id插入BM25和FAISS
-    - 更新: 通过vector_retriever更新DocumentStorage (自动同步)
-    - 删除: 先删除BM25，再通过FaissVecDB.delete()删除DocumentStorage和向量
+    - 添加: 先插入 PgVecDB 获取 id，再用此 id 插入 BM25 索引
+    - 更新: 通过 vector_retriever 更新 PgVecDB (自动同步)
+    - 删除: 先删除 BM25，再通过 PgVecDB.delete() 删除文档和向量
     """
 
     def __init__(
         self,
-        db_path: str,
-        faiss_db,
+        vec_db,
         graph_vector_db=None,
         llm_provider=None,
         config: dict[str, Any] | None = None,
@@ -83,8 +75,8 @@ class MemoryEngine:
         初始化记忆引擎
 
         Args:
-            db_path: SQLite数据库路径
-            faiss_db: FAISS向量数据库实例
+            vec_db: PgVecDB 向量数据库实例
+            graph_vector_db: 图记忆向量数据库实例 (可选)
             llm_provider: LLM提供者(可选,用于高级功能)
             config: 配置字典,支持以下参数:
                 - rrf_k: RRF参数,默认60
@@ -95,8 +87,7 @@ class MemoryEngine:
                 - cleanup_importance_threshold: 清理重要性阈值,默认0.3
                 - stopwords_path: 停用词文件路径(可选)
         """
-        self.db_path = db_path
-        self.faiss_db = faiss_db
+        self.vec_db = vec_db
         self.graph_vector_db = graph_vector_db
         self.llm_provider = llm_provider
         self.config = config or {}
@@ -105,9 +96,6 @@ class MemoryEngine:
             self.config.get("graph_memory_atom_enabled", True)
             or self.config.get("atom_enabled", False)
         )
-
-        # 确保数据库目录存在
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
         # 后台任务跟踪
         self._pending_tasks: set[asyncio.Task] = set()
@@ -155,13 +143,13 @@ class MemoryEngine:
 
         # 5. 初始化BM25检索器
         self.bm25_retriever = BM25Retriever(
-            self.db_path, self.text_processor, self.config
+            "", self.text_processor, self.config
         )
         await self.bm25_retriever.initialize()
         logger.info("[MemoryEngine] BM25Retriever 初始化完成")
 
         # 6. 初始化向量检索器
-        self.vector_retriever = VectorRetriever(self.faiss_db, self.config)
+        self.vector_retriever = VectorRetriever(self.vec_db, self.config)
         logger.info("[MemoryEngine] VectorRetriever 初始化完成")
 
         # 7. 初始化混合检索器
@@ -171,10 +159,10 @@ class MemoryEngine:
         logger.info("[MemoryEngine] HybridRetriever 初始化完成")
 
         if self.graph_enabled and self.graph_vector_db is not None:
-            self.graph_store = GraphStore(self.db_path)
+            self.graph_store = GraphStore()
             await self.graph_store.initialize()
 
-            self.atom_store = AtomStore(self.db_path)
+            self.atom_store = AtomStore()
             await self.atom_store.initialize()
 
             if self.atom_enabled:
@@ -364,10 +352,10 @@ class MemoryEngine:
         Returns:
             Optional[Dict]: 记忆数据,包含text和metadata
         """
-        # 从faiss_db的document_storage获取文档
+        # 从vec_db的document_storage获取文档
         try:
             # 使用 get_documents (复数) 并传入 ids 参数
-            docs = await self.faiss_db.document_storage.get_documents(
+            docs = await self.vec_db.document_storage.get_documents(
                 metadata_filters={}, ids=[memory_id], limit=1
             )
 
@@ -556,7 +544,7 @@ class MemoryEngine:
         if self.graph_memory_manager is None:
             return {"rebuilt": 0, "skipped": 0}
 
-        total_count = await self.faiss_db.document_storage.count_documents(
+        total_count = await self.vec_db.document_storage.count_documents(
             metadata_filters={}
         )
         batch_size = 200
@@ -565,7 +553,7 @@ class MemoryEngine:
         skipped = 0
 
         while offset < total_count:
-            docs = await self.faiss_db.document_storage.get_documents(
+            docs = await self.vec_db.document_storage.get_documents(
                 metadata_filters={},
                 limit=batch_size,
                 offset=offset,
@@ -721,7 +709,7 @@ class MemoryEngine:
         try:
 
             # 先获取总数判断是否需要分批
-            total_count = await self.faiss_db.document_storage.count_documents(
+            total_count = await self.vec_db.document_storage.count_documents(
                 metadata_filters={"session_id": session_id}
             )
 
@@ -730,7 +718,7 @@ class MemoryEngine:
 
             # 如果总数小于等于limit，直接一次性获取
             if total_count <= limit:
-                all_docs = await self.faiss_db.document_storage.get_documents(
+                all_docs = await self.vec_db.document_storage.get_documents(
                     metadata_filters={"session_id": session_id},
                     limit=limit,
                     offset=0,
@@ -752,7 +740,7 @@ class MemoryEngine:
                 offset = 0
 
                 while offset < total_count:
-                    batch = await self.faiss_db.document_storage.get_documents(
+                    batch = await self.vec_db.document_storage.get_documents(
                         metadata_filters={"session_id": session_id},
                         limit=batch_size,
                         offset=offset,
@@ -791,12 +779,12 @@ class MemoryEngine:
 
     async def _execute_with_retry(self, coro_factory, description: str, max_retries: int = 3):
         """Execute a database operation with retry on lock errors."""
-        import sqlite3 as _sqlite3
         for attempt in range(max_retries):
             try:
                 return await coro_factory()
-            except (_sqlite3.OperationalError, Exception) as e:
-                if "database is locked" in str(e) and attempt < max_retries - 1:
+            except Exception as e:
+                error_msg = str(e).lower()
+                if ("deadlock" in error_msg or "lock" in error_msg) and attempt < max_retries - 1:
                     wait = 2 ** attempt
                     logger.warning(
                         f"[批量删除] {description} 遇到数据库锁，{wait}s 后重试 "
@@ -831,7 +819,7 @@ class MemoryEngine:
                 "FTS 删除",
             )
 
-            # 2. Look up UUIDs and delete from FAISS vector DB
+            # 2. Look up UUIDs and delete from vector DB
             cursor = await self._execute_with_retry(
                 lambda: self.db_connection.execute(
                     f"SELECT id, doc_id FROM documents WHERE id IN ({placeholders})",
@@ -844,10 +832,10 @@ class MemoryEngine:
                 uuid_doc_id = row["doc_id"]
                 if uuid_doc_id:
                     try:
-                        await self.faiss_db.delete(uuid_doc_id)
+                        await self.vec_db.delete(uuid_doc_id)
                     except Exception:
                         logger.debug(
-                            f"[批量删除] FAISS 删除失败 (id={row['id']})",
+                            f"[批量删除] 向量删除失败 (id={row['id']})",
                             exc_info=True,
                         )
 
@@ -920,7 +908,7 @@ class MemoryEngine:
         # 分批扫描文档并删除，避免一次性加载所有数据到内存
         try:
             # 先获取总数
-            total_count = await self.faiss_db.document_storage.count_documents(
+            total_count = await self.vec_db.document_storage.count_documents(
                 metadata_filters={}
             )
 
@@ -933,7 +921,7 @@ class MemoryEngine:
 
             # First pass: scan candidates without deleting to avoid offset-shift skips.
             while offset < total_count:
-                batch_docs = await self.faiss_db.document_storage.get_documents(
+                batch_docs = await self.vec_db.document_storage.get_documents(
                     metadata_filters={}, limit=batch_size, offset=offset
                 )
 
@@ -1123,7 +1111,7 @@ class MemoryEngine:
         """
         try:
             # 使用 count_documents() 高效获取总数（不加载数据）
-            total_count = await self.faiss_db.document_storage.count_documents(
+            total_count = await self.vec_db.document_storage.count_documents(
                 metadata_filters={}
             )
 
@@ -1144,7 +1132,7 @@ class MemoryEngine:
 
             while offset < total_count:
                 # 获取一批文档
-                batch_docs = await self.faiss_db.document_storage.get_documents(
+                batch_docs = await self.vec_db.document_storage.get_documents(
                     metadata_filters={}, limit=batch_size, offset=offset
                 )
 

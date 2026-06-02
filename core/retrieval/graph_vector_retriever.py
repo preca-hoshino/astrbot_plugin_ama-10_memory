@@ -21,8 +21,8 @@ class GraphVectorResult:
 class GraphVectorRetriever:
     """Wrap a vector store dedicated to graph-memory entries."""
 
-    def __init__(self, faiss_db, config: dict[str, Any] | None = None):
-        self.faiss_db = faiss_db
+    def __init__(self, vec_db, config: dict[str, Any] | None = None):
+        self.vec_db = vec_db
         self.config = config or {}
 
     def _coerce_metadata(self, raw_metadata: Any) -> dict[str, Any]:
@@ -38,7 +38,7 @@ class GraphVectorRetriever:
 
     async def add_entry(self, content: str, metadata: dict[str, Any]) -> int:
         """Insert one graph entry into the vector database."""
-        return await self.faiss_db.insert(content=content, metadata=metadata)
+        return await self.vec_db.insert(content=content, metadata=metadata)
 
     async def search(
         self,
@@ -59,7 +59,7 @@ class GraphVectorRetriever:
             metadata_filters["persona_id"] = persona_id
 
         fetch_k = k * 2 if metadata_filters else k
-        raw_results = await self.faiss_db.retrieve(
+        raw_results = await self.vec_db.retrieve(
             query=query,
             k=k,
             fetch_k=fetch_k,
@@ -87,7 +87,7 @@ class GraphVectorRetriever:
 
     async def _get_uuid_from_id(self, vector_doc_id: int) -> str | None:
         """Resolve the internal UUID used by the underlying vector store."""
-        docs = await self.faiss_db.document_storage.get_documents(
+        docs = await self.vec_db.document_storage.get_documents(
             metadata_filters={},
             ids=[vector_doc_id],
             limit=1,
@@ -101,14 +101,14 @@ class GraphVectorRetriever:
         uuid_doc_id = await self._get_uuid_from_id(vector_doc_id)
         if not uuid_doc_id:
             return False
-        await self.faiss_db.delete(uuid_doc_id)
+        await self.vec_db.delete(uuid_doc_id)
         return True
 
     async def update_metadata(
         self, vector_doc_id: int, metadata: dict[str, Any]
     ) -> bool:
         """Update graph entry metadata stored inside the vector-doc storage."""
-        docs = await self.faiss_db.document_storage.get_documents(
+        docs = await self.vec_db.document_storage.get_documents(
             metadata_filters={},
             ids=[vector_doc_id],
             limit=1,
@@ -120,7 +120,7 @@ class GraphVectorRetriever:
         merged_metadata = dict(self._coerce_metadata(current_doc.get("metadata")))
         merged_metadata.update(metadata)
         async with (
-            self.faiss_db.document_storage.get_session() as session,
+            self.vec_db.document_storage.get_session() as session,
             session.begin(),
         ):
             from sqlalchemy import text

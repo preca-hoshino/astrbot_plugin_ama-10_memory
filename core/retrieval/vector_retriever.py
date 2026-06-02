@@ -1,6 +1,6 @@
 """
-向量检索器 - 基于Faiss/pgvector的向量密集检索
-封装AstrBot的BaseVecDB,提供统一的检索接口
+向量检索器 - 基于 pgvector 的向量密集检索
+封装 PgVecDB，提供统一的检索接口
 """
 
 from dataclasses import dataclass
@@ -23,7 +23,7 @@ class VectorRetriever:
     """
     向量密集检索器
 
-    封装AstrBot的FaissVecDB,提供统一的向量相似度检索接口。
+    封装AstrBot的PgVecDB,提供统一的向量相似度检索接口。
     主要特性:
     1. 保持查询文本原样检索，避免额外预处理带来的行为分叉
     2. 元数据包含:importance, create_time, last_access_time, session_id, persona_id
@@ -34,17 +34,17 @@ class VectorRetriever:
 
     def __init__(
         self,
-        faiss_db: BaseVecDB,
+        vec_db: BaseVecDB,
         config: dict[str, Any] | None = None,
     ):
         """
         初始化向量检索器
 
         Args:
-            faiss_db: BaseVecDB实例 (FaissVecDB 或 PgVecDB)
+            vec_db: BaseVecDB实例 (PgVecDB 或 PgVecDB)
             config: 配置字典(可选)
         """
-        self.faiss_db = faiss_db
+        self.vec_db = vec_db
         self.config = config or {}
 
         # 优化3: ID映射缓存 (int_id -> uuid)
@@ -99,7 +99,7 @@ class VectorRetriever:
                 f"截断至 {_MAX_CONTENT_CHARS} 字符"
             )
             insert_content = insert_content[:_MAX_CONTENT_CHARS]
-        doc_id = await self.faiss_db.insert(content=insert_content, metadata=metadata)
+        doc_id = await self.vec_db.insert(content=insert_content, metadata=metadata)
 
         return doc_id
 
@@ -152,7 +152,7 @@ class VectorRetriever:
         # fetch_k设置为k*2以确保过滤后有足够的结果
         fetch_k = k * 2 if metadata_filters else k
 
-        faiss_results = await self.faiss_db.retrieve(
+        vec_results = await self.vec_db.retrieve(
             query=processed_query,
             k=k,
             fetch_k=fetch_k,
@@ -163,14 +163,14 @@ class VectorRetriever:
 
         # 转换为VectorResult格式
         results = []
-        for result in faiss_results:
-            # FaissVecDB返回的Result对象包含similarity和data
+        for result in vec_results:
+            # PgVecDB返回的Result对象包含similarity和data
             # data是包含id, text, metadata的字典
             doc_data = result.data
             results.append(
                 VectorResult(
                     doc_id=doc_data["id"],
-                    score=result.similarity,  # FaissVecDB已经归一化到[0,1]
+                    score=result.similarity,  # PgVecDB已经归一化到[0,1]
                     content=doc_data["text"],
                     metadata=doc_data["metadata"],
                 )
@@ -195,7 +195,7 @@ class VectorRetriever:
         from astrbot.api import logger
 
         try:
-            doc_storage = self.faiss_db.document_storage
+            doc_storage = self.vec_db.document_storage
             docs = await doc_storage.get_documents(
                 metadata_filters={}, ids=[doc_id], limit=1
             )
@@ -231,7 +231,7 @@ class VectorRetriever:
         from astrbot.api import logger
 
         try:
-            doc_storage = self.faiss_db.document_storage
+            doc_storage = self.vec_db.document_storage
 
             # 通过 id 获取文档
             docs = await doc_storage.get_documents(
@@ -282,7 +282,7 @@ class VectorRetriever:
 
     async def delete_document(self, doc_id: int) -> bool:
         """
-        删除文档（修复版：正确使用 FaissVecDB.delete API + 缓存优化）
+        删除文档（修复版：正确使用 PgVecDB.delete API + 缓存优化）
 
         Args:
             doc_id: 文档ID (documents表中的整数id)
@@ -300,9 +300,9 @@ class VectorRetriever:
                 logger.warning(f"[向量删除] 文档不存在或缺少UUID (doc_id={doc_id})")
                 return False
 
-            # 使用 UUID 调用 FaissVecDB.delete()
+            # 使用 UUID 调用 PgVecDB.delete()
             # 这会同时删除 document_storage 和 embedding_storage
-            await self.faiss_db.delete(uuid_doc_id)
+            await self.vec_db.delete(uuid_doc_id)
 
             # 从缓存中移除
             self._id_cache.pop(doc_id, None)

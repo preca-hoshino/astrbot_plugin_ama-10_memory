@@ -1,16 +1,9 @@
 {
   "database_settings": {
     "description": "数据库后端",
-    "hint": "选择存储后端。留空使用本地 SQLite/FAISS，填写 PG URL 使用 PostgreSQL + pgvector。",
+    "hint": "配置 PostgreSQL + pgvector 连接。本插件仅支持 PostgreSQL。",
     "type": "object",
     "items": {
-      "backend": {
-        "description": "存储后端",
-        "hint": "留空 = 本地 SQLite/FAISS (默认)。填写 'pg' = 使用下方 PostgreSQL 连接。",
-        "type": "string",
-        "options": ["", "pg"],
-        "default": ""
-      },
       "pg_dsn": {
         "description": "PostgreSQL 连接 URL",
         "hint": "格式: postgresql://user:password@host:port/database",

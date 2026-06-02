@@ -3,7 +3,6 @@
 负责处理插件命令
 """
 
-import os
 from collections.abc import AsyncGenerator
 from datetime import datetime
 
@@ -88,10 +87,19 @@ class CommandHandler:
                     "%Y-%m-%d %H:%M:%S"
                 )
 
-            # 计算数据库大小
+            # 计算数据库大小 (PostgreSQL)
             db_size = 0.0
-            if os.path.exists(self.memory_engine.db_path):
-                db_size = os.path.getsize(self.memory_engine.db_path) / (1024 * 1024)
+            try:
+                from .storage.pg_connection import get_pool
+                pool = get_pool()
+                async with pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        "SELECT pg_database_size(current_database()) as size"
+                    )
+                    if row:
+                        db_size = row["size"] / (1024 * 1024)
+            except Exception:
+                pass
 
             session_count = len(stats.get("sessions", {}))
 

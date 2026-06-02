@@ -3,11 +3,11 @@
 """
 
 import asyncio
-import os
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
-import aiosqlite
+from ...storage.pg_connection import get_pool
+from ...storage.pg_adapter import PgContextManager
 
 from astrbot.api import logger
 
@@ -33,16 +33,14 @@ class IndexValidator:
     检测documents表与BM25索引、向量索引之间的一致性
     """
 
-    def __init__(self, db_path: str, faiss_db: Any):
+    def __init__(self, vec_db: Any):
         """
         初始化验证器
 
         Args:
-            db_path: SQLite数据库路径
-            faiss_db: FaissVecDB实例
+            vec_db: PgVecDB 实例
         """
-        self.db_path = db_path
-        self.faiss_db = faiss_db
+        self.vec_db = vec_db
 
     DEFAULT_REBUILD_BATCH_SIZE = 50
     DEFAULT_EMBEDDING_BATCH_SIZE = 8
@@ -60,7 +58,7 @@ class IndexValidator:
         """清空 BM25 索引表，不触碰 documents 原始数据。"""
         for attempt in range(max_attempts):
             try:
-                async with aiosqlite.connect(self.db_path) as db:
+                async with PgContextManager(get_pool()) as db:
                     await db.execute("PRAGMA busy_timeout = 10000")
                     try:
                         await db.execute(f"DELETE FROM {table_name}")
@@ -75,7 +73,7 @@ class IndexValidator:
                 ):
                     wait_seconds = 0.2 * (attempt + 1)
                     logger.warning(
-                        f"清空SQLite存储遇到锁，{wait_seconds:.1f}s后重试 "
+                        f"清空存储遇到锁，{wait_seconds:.1f}s后重试 "
                         f"({attempt + 1}/{max_attempts}): {e}"
                     )
                     await asyncio.sleep(wait_seconds)
@@ -90,7 +88,7 @@ class IndexValidator:
             IndexStatus: 索引状态信息
         """
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with PgContextManager(get_pool()) as db:
                 # 1. 获取documents表中的文档数和ID集合
                 cursor = await db.execute("SELECT COUNT(*) FROM documents")
                 count_result = await cursor.fetchone()
@@ -101,7 +99,7 @@ class IndexValidator:
 
                 # 2. 检查BM25索引（ama_10_memories_fts表）
                 cursor = await db.execute("""
-                    SELECT name FROM sqlite_master
+                    SELECT tablename AS name FROM pg_tables WHERE schemaname = 'public'
                     WHERE type='table' AND name='ama_10_memories_fts'
                 """)
                 has_fts_table = await cursor.fetchone()
@@ -121,30 +119,15 @@ class IndexValidator:
                     bm25_count = 0
                     bm25_ids = set()
 
-                # 3. 检查向量索引
+                # 3. 检查向量索引 (PostgreSQL)
                 vector_count = 0
                 vector_ids = set()
 
                 try:
-                    embedding_storage = getattr(
-                        self.faiss_db, "embedding_storage", None
-                    )
-                    index = getattr(embedding_storage, "index", None)
-                    if index is not None:
-                        vector_count = int(getattr(index, "ntotal", 0))
-                        # Try to get concrete vector IDs from IndexIDMap.
-                        try:
-                            import faiss
-
-                            if hasattr(index, "id_map"):
-                                vector_to_array = getattr(
-                                    faiss, "vector_to_array", None
-                                )
-                                if callable(vector_to_array):
-                                    raw_ids = cast(Any, vector_to_array(index.id_map))
-                                    vector_ids = {int(i) for i in raw_ids}
-                        except Exception as e:
-                            logger.debug(f"读取向量ID失败，使用计数模式: {e}")
+                    vector_count = await self._get_vector_count()
+                    v_ids = await self._get_vector_ids()
+                    if v_ids is not None:
+                        vector_ids = v_ids
                 except Exception as e:
                     logger.warning(f"检查向量索引失败: {e}")
 
@@ -176,7 +159,7 @@ class IndexValidator:
                     is_consistent = False
                     reason = "BM25索引中存在冗余数据"
                 elif vector_count > documents_count:
-                    # FAISS ntotal 包含逻辑删除的槽位，冗余向量不影响召回正确性，
+                    # 向量库 ntotal 包含逻辑删除的槽位，冗余向量不影响召回正确性，
                     # 不触发全量重建（否则每次启动都会重建）
                     is_consistent = True
                     reason = f"向量索引含{vector_count - documents_count}条冗余槽位（正常，不影响召回）"
@@ -216,10 +199,10 @@ class IndexValidator:
             Tuple[bool, int]: (是否需要重建, 待处理文档数)
         """
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with PgContextManager(get_pool()) as db:
                 # 检查migration_status表
                 cursor = await db.execute("""
-                    SELECT name FROM sqlite_master
+                    SELECT tablename AS name FROM pg_tables WHERE schemaname = 'public'
                     WHERE type='table' AND name='migration_status'
                 """)
                 has_table = await cursor.fetchone()
@@ -327,13 +310,13 @@ class IndexValidator:
         )
 
     async def _get_document_count(self) -> int:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with PgContextManager(get_pool()) as db:
             cursor = await db.execute("SELECT COUNT(*) FROM documents")
             row = await cursor.fetchone()
             return int(row[0]) if row else 0
 
     async def _get_document_ids(self) -> set[int]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with PgContextManager(get_pool()) as db:
             cursor = await db.execute("SELECT id FROM documents")
             return {int(row[0]) for row in await cursor.fetchall()}
 
@@ -347,7 +330,7 @@ class IndexValidator:
             for start in range(0, len(sorted_ids), batch_size):
                 chunk = sorted_ids[start : start + batch_size]
                 placeholders = ",".join("?" for _ in chunk)
-                async with aiosqlite.connect(self.db_path) as db:
+                async with PgContextManager(get_pool()) as db:
                     await db.execute("PRAGMA busy_timeout = 10000")
                     cursor = await db.execute(
                         f"""
@@ -363,7 +346,7 @@ class IndexValidator:
 
         last_id = 0
         while True:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with PgContextManager(get_pool()) as db:
                 await db.execute("PRAGMA busy_timeout = 10000")
                 cursor = await db.execute(
                     """
@@ -382,29 +365,23 @@ class IndexValidator:
             last_id = int(rows[-1][0])
             yield rows
 
-    def _get_vector_count(self) -> int:
-        embedding_storage = getattr(self.faiss_db, "embedding_storage", None)
-        index = getattr(embedding_storage, "index", None)
-        if index is None:
-            return 0
-        return int(getattr(index, "ntotal", 0))
-
-    def _get_vector_ids(self) -> set[int] | None:
-        embedding_storage = getattr(self.faiss_db, "embedding_storage", None)
-        index = getattr(embedding_storage, "index", None)
-        if index is None:
-            return set()
+    async def _get_vector_count(self) -> int:
+        """获取向量索引中的文档数量 (PostgreSQL)"""
         try:
-            import faiss
+            return await self.vec_db.count_documents()
+        except Exception:
+            return 0
 
-            if hasattr(index, "id_map"):
-                vector_to_array = getattr(faiss, "vector_to_array", None)
-                if callable(vector_to_array):
-                    raw_ids = cast(Any, vector_to_array(index.id_map))
-                    return {int(i) for i in raw_ids}
+    async def _get_vector_ids(self) -> set[int] | None:
+        """获取向量索引中的所有文档 ID (PostgreSQL)"""
+        try:
+            async with PgContextManager(get_pool()) as db:
+                cursor = await db.execute("SELECT id FROM documents")
+                rows = await cursor.fetchall()
+                return {int(row[0]) for row in rows}
         except Exception as e:
             logger.debug(f"读取向量ID失败: {e}")
-        return None
+            return None
 
     async def _rebuild_bm25_index(
         self,
@@ -446,7 +423,7 @@ class IndexValidator:
 
             if rows_to_insert:
                 try:
-                    async with aiosqlite.connect(self.db_path) as db:
+                    async with PgContextManager(get_pool()) as db:
                         await db.execute("PRAGMA busy_timeout = 10000")
                         await db.executemany(
                             f"INSERT INTO {table_name}(doc_id, content) VALUES (?, ?)",
@@ -460,7 +437,7 @@ class IndexValidator:
                     )
                     for row_doc_id, processed_content in rows_to_insert:
                         try:
-                            async with aiosqlite.connect(self.db_path) as db:
+                            async with PgContextManager(get_pool()) as db:
                                 await db.execute("PRAGMA busy_timeout = 10000")
                                 await db.execute(
                                     f"INSERT INTO {table_name}(doc_id, content) VALUES (?, ?)",
@@ -579,13 +556,11 @@ class IndexValidator:
         options: dict[str, Any],
         progress_callback=None,
     ) -> dict[str, Any]:
-        import numpy as np
-
-        faiss_db = getattr(memory_engine, "faiss_db", None)
-        embedding_storage = getattr(faiss_db, "embedding_storage", None)
-        provider = getattr(faiss_db, "embedding_provider", None)
-        if embedding_storage is None or provider is None:
-            raise RuntimeError("无法修复向量索引：Embedding 组件未初始化")
+        """修复缺失的向量 (PostgreSQL pgvector)"""
+        vec_db = getattr(memory_engine, "vec_db", None)
+        provider = getattr(vec_db, "embedding_provider", None)
+        if provider is None:
+            raise RuntimeError("无法修复向量索引：Embedding Provider 未初始化")
 
         total = len(missing_ids)
         processed = 0
@@ -608,12 +583,13 @@ class IndexValidator:
             )
             try:
                 vectors = await self._embed_batch_with_retry(provider, contents, options)
-                vectors_array = np.asarray(vectors, dtype=np.float32)
-                if vectors_array.ndim != 2 or len(vectors_array) != len(ids):
-                    raise ValueError(
-                        f"Embedding 返回数量不匹配: 期望 {len(ids)}，实际 {len(vectors_array)}"
-                    )
-                await embedding_storage.insert_batch(vectors_array, ids)
+                async with PgContextManager(get_pool()) as db:
+                    for doc_id, embedding in zip(ids, vectors):
+                        vec_str = "[" + ",".join(str(v) for v in embedding) + "]"
+                        await db.execute(
+                            "UPDATE documents_vec SET embedding = $1::vector WHERE id = $2",
+                            (vec_str, doc_id),
+                        )
                 processed += len(ids)
             except Exception as e:
                 failed_ids.update(ids)
@@ -653,20 +629,12 @@ class IndexValidator:
         options: dict[str, Any],
         progress_callback=None,
     ) -> dict[str, Any]:
-        import faiss
-        import numpy as np
+        """全量重建向量索引 (PostgreSQL pgvector)"""
+        vec_db = getattr(memory_engine, "vec_db", None)
+        provider = getattr(vec_db, "embedding_provider", None)
+        if provider is None:
+            raise RuntimeError("无法重建向量索引：Embedding Provider 未初始化")
 
-        faiss_db = getattr(memory_engine, "faiss_db", None)
-        embedding_storage = getattr(faiss_db, "embedding_storage", None)
-        provider = getattr(faiss_db, "embedding_provider", None)
-        if embedding_storage is None or provider is None:
-            raise RuntimeError("无法重建向量索引：Embedding 组件未初始化")
-
-        dimension = int(getattr(embedding_storage, "dimension", 0) or 0)
-        if dimension <= 0:
-            raise RuntimeError("无法重建向量索引：索引维度无效")
-
-        temp_index = faiss.IndexIDMap(faiss.IndexFlatL2(dimension))
         processed = 0
         failed_ids: set[int] = set()
         batch_delay = float(options["batch_delay"])
@@ -685,16 +653,14 @@ class IndexValidator:
             )
             try:
                 vectors = await self._embed_batch_with_retry(provider, contents, options)
-                vectors_array = np.asarray(vectors, dtype=np.float32)
-                if vectors_array.ndim != 2 or len(vectors_array) != len(ids):
-                    raise ValueError(
-                        f"Embedding 返回数量不匹配: 期望 {len(ids)}，实际 {len(vectors_array)}"
-                    )
-                if vectors_array.shape[1] != dimension:
-                    raise ValueError(
-                        f"Embedding 维度不匹配: 期望 {dimension}，实际 {vectors_array.shape[1]}"
-                    )
-                temp_index.add_with_ids(vectors_array, np.asarray(ids, dtype=np.int64))
+                # 更新 PG 向量表
+                async with PgContextManager(get_pool()) as db:
+                    for doc_id, embedding in zip(ids, vectors):
+                        vec_str = "[" + ",".join(str(v) for v in embedding) + "]"
+                        await db.execute(
+                            "UPDATE documents_vec SET embedding = $1::vector WHERE id = $2",
+                            (vec_str, doc_id),
+                        )
                 processed += len(ids)
             except Exception as e:
                 failed_ids.update(ids)
@@ -738,20 +704,6 @@ class IndexValidator:
                 "partial": True,
             }
 
-        index_path = getattr(embedding_storage, "path", None)
-        if index_path:
-            temp_path = f"{index_path}.rebuild.tmp"
-            try:
-                faiss.write_index(temp_index, temp_path)
-                os.replace(temp_path, index_path)
-            finally:
-                if os.path.exists(temp_path):
-                    try:
-                        os.remove(temp_path)
-                    except OSError:
-                        pass
-
-        embedding_storage.index = temp_index
         return {
             "mode": "full",
             "processed": processed,
@@ -820,7 +772,7 @@ class IndexValidator:
         from datetime import datetime, timezone
 
         try:
-            async with aiosqlite.connect(self.db_path) as status_db:
+            async with PgContextManager(get_pool()) as status_db:
                 await status_db.execute("""
                     CREATE TABLE IF NOT EXISTS migration_status (
                         key TEXT PRIMARY KEY,
@@ -863,7 +815,7 @@ class IndexValidator:
         安全策略：
         1. documents 表只读，始终作为原始数据源。
         2. BM25 直接按 documents 分批重建。
-        3. 向量索引优先增量补缺；需要全量重建时先构建临时 FAISS 索引。
+        3. 向量索引优先增量补缺；需要全量重建时先构建临时向量索引。
         4. 失败率超过阈值时不切换全量重建的新向量索引。
 
         Args:
@@ -995,12 +947,12 @@ class IndexValidator:
         仅在备份表存在且 documents 表为空时执行恢复。
         """
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with PgContextManager(get_pool()) as db:
                 await db.execute("PRAGMA busy_timeout = 10000")
 
                 # 检查备份表是否存在
                 cursor = await db.execute("""
-                    SELECT name FROM sqlite_master
+                    SELECT tablename AS name FROM pg_tables WHERE schemaname = 'public'
                     WHERE type='table' AND name='_documents_rebuild_backup'
                 """)
                 if not await cursor.fetchone():
