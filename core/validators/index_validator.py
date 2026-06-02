@@ -55,7 +55,7 @@ class IndexValidator:
     DEFAULT_MAX_FAILURE_RATIO = 0.02
 
     async def _clear_bm25_with_retry(
-        self, table_name: str = "ama10_memories_fts", max_attempts: int = 5
+        self, table_name: str = "ama_10_memories_fts", max_attempts: int = 5
     ) -> None:
         """清空 BM25 索引表，不触碰 documents 原始数据。"""
         for attempt in range(max_attempts):
@@ -99,22 +99,22 @@ class IndexValidator:
                 cursor = await db.execute("SELECT id FROM documents")
                 doc_ids = {row[0] for row in await cursor.fetchall()}
 
-                # 2. 检查BM25索引（ama10_memories_fts表）
+                # 2. 检查BM25索引（ama_10_memories_fts表）
                 cursor = await db.execute("""
                     SELECT name FROM sqlite_master
-                    WHERE type='table' AND name='ama10_memories_fts'
+                    WHERE type='table' AND name='ama_10_memories_fts'
                 """)
                 has_fts_table = await cursor.fetchone()
 
                 if has_fts_table:
                     cursor = await db.execute(
-                        "SELECT COUNT(DISTINCT doc_id) FROM ama10_memories_fts"
+                        "SELECT COUNT(DISTINCT doc_id) FROM ama_10_memories_fts"
                     )
                     bm25_result = await cursor.fetchone()
                     bm25_count = bm25_result[0] if bm25_result else 0
 
                     cursor = await db.execute(
-                        "SELECT DISTINCT doc_id FROM ama10_memories_fts"
+                        "SELECT DISTINCT doc_id FROM ama_10_memories_fts"
                     )
                     bm25_ids = {row[0] for row in await cursor.fetchall()}
                 else:
@@ -420,7 +420,7 @@ class IndexValidator:
         if text_processor is None:
             raise RuntimeError("无法重建 BM25：TextProcessor 未初始化")
 
-        table_name = getattr(bm25_retriever, "fts_table", "ama10_memories_fts")
+        table_name = getattr(bm25_retriever, "fts_table", "ama_10_memories_fts")
         batch_size = int(options["batch_size"])
         max_failure_ratio = float(options["max_failure_ratio"])
 

@@ -293,7 +293,7 @@ class PluginInitializer:
         try:
             # 初始化数据库
             data_dir_path = Path(self.data_dir)
-            db_path = data_dir_path / "ama10_memory.db"
+            db_path = data_dir_path / "ama_10_memory.db"
             graph_memory_enabled = self.config_manager.get("graph_memory.enabled", True)
 
             logger.debug(f"[Initializer] data_dir={self.data_dir}, graph_enabled={graph_memory_enabled}")

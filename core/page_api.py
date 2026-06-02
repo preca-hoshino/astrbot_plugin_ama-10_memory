@@ -19,7 +19,7 @@ from quart import request
 from ..storage.pg_connection import get_pool
 from .managers.backup_manager import BackupManager
 
-PLUGIN_NAME = "astrbot_plugin_ama10_memory"
+PLUGIN_NAME = "astrbot_plugin_ama_10_memory"
 PAGE_API_PREFIX = f"/{PLUGIN_NAME}/page"
 
 

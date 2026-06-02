@@ -2,7 +2,7 @@
 
 > 为 [AstrBot](https://github.com/Soulter/AstrBot) 打造的智能长期记忆插件，拥有完整的记忆生命周期管理、图记忆、多路召回等能力。
 
-**本项目 Fork 自 [lxfight/astrbot_plugin_livingmemory](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory)，基于 GPLv3 协议重新发布。感谢原作者 [lxfight](https://github.com/lxfight) 的贡献。**
+**本项目 Fork 自 [lxfight/astrbot_plugin_livingmemory](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory)，基于 AGPL-3.0 协议发布。感谢原作者 [lxfight](https://github.com/lxfight) 的贡献。**
 
 ---
 
@@ -28,7 +28,7 @@
 
 ```bash
 cd /path/to/AstrBot/data/plugins
-git clone https://github.com/preca-hoshino/astrbot_plugin_ama-10_memory.git astrbot_plugin_ama10_memory
+git clone https://github.com/preca-hoshino/astrbot_plugin_ama-10_memory.git astrbot_plugin_ama_10_memory
 ```
 
 然后在 AstrBot 管理面板中启用插件，重启 AstrBot。
@@ -124,8 +124,8 @@ core/
 
 如果你正在使用 `lxfight/astrbot_plugin_livingmemory`，迁移到 AMA-10 Memory 需要注意：
 
-1. **数据库不兼容** — AMA-10 Memory 使用 `ama10_memory.db` 等新文件名，旧数据不会自动迁移
-2. **手动迁移** — 如需保留旧数据，可将 `livingmemory.db` 重命名为 `ama10_memory.db`（表结构兼容）
+1. **数据库不兼容** — AMA-10 Memory 使用 `ama_10_memory.db` 等新文件名，旧数据不会自动迁移
+2. **手动迁移** — 如需保留旧数据，可将 `livingmemory.db` 重命名为 `ama_10_memory.db`（表结构兼容）
 3. **配置** — 配置格式基本兼容，但插件名称已更改
 
 ## 🙏 致谢
@@ -137,6 +137,6 @@ core/
 
 ## 📄 许可证
 
-本项目基于 [GNU General Public License v3.0](LICENSE) 开源。
+本项目基于 [GNU Affero General Public License v3.0](LICENSE) 开源。
 
-原始代码来自 [lxfight/astrbot_plugin_livingmemory](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory)（AGPL-3.0），本项目在 GPLv3 协议下重新发布。
+原始代码来自 [lxfight/astrbot_plugin_livingmemory](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory)（AGPL-3.0），本项目在同一协议下发布。

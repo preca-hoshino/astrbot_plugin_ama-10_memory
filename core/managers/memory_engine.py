@@ -51,7 +51,7 @@ class MemoryEngine:
        - 关系: id ←→ doc_id (一对一映射)
 
     2. **BM25 FTS5索引**
-       - 表: ama10_memories_fts (SQLite FTS5虚拟表)
+       - 表: ama_10_memories_fts (SQLite FTS5虚拟表)
        - 字段: doc_id (UNINDEXED) - 引用documents.id的整数
        - 注意: 只存储分词后的内容，metadata从documents表读取
 
@@ -825,7 +825,7 @@ class MemoryEngine:
             # 1. Batch delete from BM25 FTS
             await self._execute_with_retry(
                 lambda: self.db_connection.execute(
-                    f"DELETE FROM ama10_memories_fts WHERE doc_id IN ({placeholders})",
+                    f"DELETE FROM ama_10_memories_fts WHERE doc_id IN ({placeholders})",
                     batch,
                 ),
                 "FTS 删除",

@@ -24,10 +24,10 @@ _BACKUP_INFO_FILE = "backup_info.json"
 
 # Files/patterns to include in a full backup (relative to data_dir).
 _BACKUP_PATTERNS: list[str] = [
-    "ama10_memory.db",
-    "ama10_memory.index",
-    "ama10_graph_documents.db",
-    "ama10_graph.index",
+    "ama_10_memory.db",
+    "ama_10_memory.index",
+    "ama_10_graph_documents.db",
+    "ama_10_graph.index",
     "conversations.db",
     "decay_state.json",
     "*.db-wal",
