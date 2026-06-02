@@ -1,0 +1,1244 @@
+"""
+统一记忆引擎 - MemoryEngine
+提供统一的记忆管理接口,整合所有底层组件
+"""
+
+import asyncio
+import json
+import time
+from pathlib import Path
+from typing import Any
+
+from astrbot.api import logger
+
+from ...storage.graph_store import GraphStore
+from ...storage.atom_store import AtomStore
+from ..managers.graph_memory_manager import GraphMemoryManager
+from ..managers.atom_lifecycle_manager import AtomLifecycleManager
+from ..retrieval.atom_retriever import AtomRetriever
+from ..processors.graph_extractor import GraphExtractor
+from ..processors.text_processor import TextProcessor
+from ..retrieval.bm25_retriever import BM25Retriever
+from ..retrieval.dual_route_retriever import DualRouteRetriever
+from ..retrieval.graph_keyword_retriever import GraphKeywordRetriever
+from ..retrieval.graph_retriever import GraphRetriever
+from ..retrieval.graph_vector_retriever import GraphVectorRetriever
+from ..retrieval.hybrid_retriever import HybridResult, HybridRetriever
+from ..retrieval.rrf_fusion import RRFFusion
+from ..retrieval.vector_retriever import VectorRetriever
+
+
+class MemoryEngine:
+    """
+    统一记忆引擎
+
+    整合BM25检索、向量检索和混合检索,提供完整的记忆管理接口。
+
+    主要功能:
+    1. 记忆CRUD操作(添加、检索、更新、删除)
+    2. 自动化记忆整理和清理
+    3. 重要性评估和时间衰减
+    4. 会话隔离和统计
+
+    ID管理体系说明：
+    ==================
+    本系统使用三层存储架构，统一使用整数ID作为主键：
+
+    1. **DocumentStorage (FAISS内部)**
+       - 表: documents (SQLite，由SQLAlchemy管理)
+       - 主键: id (INTEGER, AUTOINCREMENT) - 这是统一的整数标识符
+       - UUID字段: doc_id (TEXT) - FAISS内部使用的UUID字符串
+       - 关系: id ←→ doc_id (一对一映射)
+
+    2. **BM25 FTS5索引**
+       - 表: ama10_memories_fts (SQLite FTS5虚拟表)
+       - 字段: doc_id (UNINDEXED) - 引用documents.id的整数
+       - 注意: 只存储分词后的内容，metadata从documents表读取
+
+    3. **FAISS向量索引**
+       - 存储: EmbeddingStorage (FAISS索引文件)
+       - 索引ID: 使用documents.id作为向量的整数索引
+
+    插件对外接口：
+    - add_memory() 返回: int (documents.id)
+    - search_memories() 返回: HybridResult包含doc_id (int)
+    - update_memory(memory_id: int) 参数: documents.id
+    - delete_memory(memory_id: int) 参数: documents.id
+
+    同步保证：
+    - 添加: 先插入DocumentStorage获取id，再用此id插入BM25和FAISS
+    - 更新: 通过vector_retriever更新DocumentStorage (自动同步)
+    - 删除: 先删除BM25，再通过FaissVecDB.delete()删除DocumentStorage和向量
+    """
+
+    def __init__(
+        self,
+        db_path: str,
+        faiss_db,
+        graph_vector_db=None,
+        llm_provider=None,
+        config: dict[str, Any] | None = None,
+    ):
+        """
+        初始化记忆引擎
+
+        Args:
+            db_path: SQLite数据库路径
+            faiss_db: FAISS向量数据库实例
+            llm_provider: LLM提供者(可选,用于高级功能)
+            config: 配置字典,支持以下参数:
+                - rrf_k: RRF参数,默认60
+                - decay_rate: 时间衰减率,默认0.01
+                - importance_weight: 重要性权重,默认1.0
+                - fallback_enabled: 启用退化机制,默认True
+                - cleanup_days_threshold: 清理天数阈值,默认30
+                - cleanup_importance_threshold: 清理重要性阈值,默认0.3
+                - stopwords_path: 停用词文件路径(可选)
+        """
+        self.db_path = db_path
+        self.faiss_db = faiss_db
+        self.graph_vector_db = graph_vector_db
+        self.llm_provider = llm_provider
+        self.config = config or {}
+        self.graph_enabled = bool(self.config.get("graph_memory_enabled", False))
+        self.atom_enabled = bool(
+            self.config.get("graph_memory_atom_enabled", True)
+            or self.config.get("atom_enabled", False)
+        )
+
+        # 确保数据库目录存在
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+
+        # 后台任务跟踪
+        self._pending_tasks: set[asyncio.Task] = set()
+
+        # 初始化组件(在initialize中完成)
+        self.text_processor = None
+        self.bm25_retriever = None
+        self.vector_retriever = None
+        self.rrf_fusion = None
+        self.hybrid_retriever = None
+        self.graph_store = None
+        self.graph_extractor = None
+        self.graph_keyword_retriever = None
+        self.graph_vector_retriever = None
+        self.graph_retriever = None
+        self.graph_memory_manager = None
+        self.dual_route_retriever = None
+        self.atom_store = None
+        self.atom_lifecycle_manager = None
+        self.atom_retriever = None
+        self.db_connection = None
+
+    async def initialize(self):
+        """
+        异步初始化引擎
+
+        初始化所有检索器组件
+        """
+        from ...storage.pg_connection import get_pool
+        from ...storage.pg_adapter import PgPoolConnection
+
+        # 1. 连接数据库 (PostgreSQL)
+        pool = get_pool()
+        self.db_connection = PgPoolConnection(pool)
+        logger.info("[MemoryEngine] PostgreSQL 模式 (连接池)")
+        logger.debug(f"[MemoryEngine] 配置: rrf_k={self.config.get('rrf_k', 60)}, graph_enabled={self.graph_enabled}, atom_enabled={self.atom_enabled}")
+
+        # 2. 初始化文本处理器
+        stopwords_path = self.config.get("stopwords_path")
+        self.text_processor = TextProcessor(stopwords_path)
+
+        # 4. 初始化RRF融合器
+        rrf_k = self.config.get("rrf_k", 60)
+        self.rrf_fusion = RRFFusion(k=rrf_k)
+
+        # 5. 初始化BM25检索器
+        self.bm25_retriever = BM25Retriever(
+            self.db_path, self.text_processor, self.config
+        )
+        await self.bm25_retriever.initialize()
+        logger.info("[MemoryEngine] BM25Retriever 初始化完成")
+
+        # 6. 初始化向量检索器
+        self.vector_retriever = VectorRetriever(self.faiss_db, self.config)
+        logger.info("[MemoryEngine] VectorRetriever 初始化完成")
+
+        # 7. 初始化混合检索器
+        self.hybrid_retriever = HybridRetriever(
+            self.bm25_retriever, self.vector_retriever, self.rrf_fusion, self.config
+        )
+        logger.info("[MemoryEngine] HybridRetriever 初始化完成")
+
+        if self.graph_enabled and self.graph_vector_db is not None:
+            self.graph_store = GraphStore(self.db_path)
+            await self.graph_store.initialize()
+
+            self.atom_store = AtomStore(self.db_path)
+            await self.atom_store.initialize()
+
+            if self.atom_enabled:
+                self.atom_lifecycle_manager = AtomLifecycleManager(
+                    self.atom_store, self.config
+                )
+                self.atom_retriever = AtomRetriever(self.atom_store, self.config)
+                await self.atom_lifecycle_manager.start()
+
+            self.graph_extractor = GraphExtractor(self.config)
+            self.graph_keyword_retriever = GraphKeywordRetriever(
+                self.graph_store,
+                self.text_processor,
+                self.config,
+            )
+            self.graph_vector_retriever = GraphVectorRetriever(
+                self.graph_vector_db,
+                self.config,
+            )
+            self.graph_retriever = GraphRetriever(
+                self.graph_keyword_retriever,
+                self.graph_vector_retriever,
+                self.rrf_fusion,
+                self.config,
+            )
+            self.graph_memory_manager = GraphMemoryManager(
+                self.graph_store,
+                self.graph_vector_retriever,
+                self.graph_extractor,
+            )
+            self.dual_route_retriever = DualRouteRetriever(
+                self.hybrid_retriever,
+                self.graph_retriever,
+                self.get_memory,
+                self.config,
+            )
+
+    async def close(self):
+        """关闭数据库连接和清理资源"""
+        if self.atom_lifecycle_manager is not None:
+            await self.atom_lifecycle_manager.stop()
+        if self._pending_tasks:
+            for task in self._pending_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*self._pending_tasks, return_exceptions=True)
+            self._pending_tasks.clear()
+        if self.db_connection:
+            await self.db_connection.close()
+        if self.graph_vector_db is not None:
+            await self.graph_vector_db.close()
+
+    def _create_tracked_task(self, coro) -> None:
+        """Create and track a background task, auto-discarding on completion."""
+        task = asyncio.create_task(coro)
+        self._pending_tasks.add(task)
+        task.add_done_callback(self._pending_tasks.discard)
+
+    # ==================== 核心记忆操作 ====================
+
+    async def add_memory(
+        self,
+        content: str,
+        session_id: str | None = None,
+        persona_id: str | None = None,
+        importance: float = 0.5,
+        metadata: dict[str, Any] | None = None,
+        atoms: list | None = None,
+    ) -> int:
+        """
+        添加新记忆
+
+        Args:
+            content: 记忆内容
+            session_id: 会话ID(支持多种格式,自动提取UUID)
+            persona_id: 人格ID(支持多种格式,自动提取UUID)
+            importance: 重要性(0-1)
+            metadata: 额外元数据
+
+        Returns:
+            int: 记忆ID(doc_id)
+        """
+        if not content or not content.strip():
+            raise ValueError("记忆内容不能为空")
+
+        # 准备完整元数据 - 保存完整的 unified_msg_origin，不提取UUID
+        # 只在查询/过滤时才提取UUID进行匹配，存储时保留完整信息
+        current_time = time.time()
+        full_metadata = {
+            "session_id": session_id,  # 保存完整的 unified_msg_origin
+            "persona_id": persona_id,  # 保存完整的 persona_id
+            "importance": max(0.0, min(1.0, importance)),  # 限制在0-1范围
+            "create_time": current_time,
+            "last_access_time": current_time,
+        }
+
+        # 合并用户提供的额外元数据
+        # 注意：先合并外部metadata，再确保时间字段不被覆盖
+        if metadata:
+            full_metadata.update(metadata)
+
+        # 确保时间字段始终存在且不被外部metadata覆盖
+        full_metadata["create_time"] = current_time
+        full_metadata["last_access_time"] = current_time
+
+        # 通过混合检索器添加(会同时添加到BM25和向量索引)
+        if self.hybrid_retriever is None:
+            raise RuntimeError("混合检索器未初始化")
+        doc_id = await self.hybrid_retriever.add_memory(content, full_metadata)
+
+        # 写入记忆原子
+        if atoms and self.atom_store is not None and self.atom_enabled:
+            for atom in atoms:
+                atom.parent_memory_id = doc_id
+                try:
+                    await self.atom_store.insert(atom)
+                except Exception:
+                    logger.error(
+                        f"[MemoryEngine] 写入记忆原子失败: {atom.content[:80]}",
+                        exc_info=True,
+                    )
+
+        if self.graph_memory_manager is not None:
+            await self.graph_memory_manager.index_memory(doc_id, content, full_metadata, atoms)
+
+        return doc_id
+
+    async def search_memories(
+        self,
+        query: str,
+        k: int = 5,
+        session_id: str | None = None,
+        persona_id: str | None = None,
+    ) -> list[HybridResult]:
+        """
+        检索相关记忆
+
+        Args:
+            query: 查询字符串
+            k: 返回数量
+            session_id: 会话ID过滤(可选,应传入unified_msg_origin完整格式)
+            persona_id: 人格ID过滤(可选)
+
+        Returns:
+            List[HybridResult]: 检索结果列表
+        """
+        if not query or not query.strip():
+            return []
+
+        # 如果session_id是unified_msg_origin格式，自动触发旧数据迁移
+        if session_id and ":" in session_id:
+            # 异步触发迁移，不阻塞查询
+            self._create_tracked_task(self._migrate_session_data_if_needed(session_id))
+
+        # 【关键修改】不再提取UUID，直接使用完整的unified_msg_origin进行匹配
+        # 因为现在数据库中存储的就是完整格式
+        # session_id 和 persona_id 保持原样传递给检索器
+
+        # 执行混合检索 / 双路检索
+        if self.dual_route_retriever is not None:
+            results = await self.dual_route_retriever.search(
+                query,
+                k,
+                session_id,
+                persona_id,
+            )
+        else:
+            if self.hybrid_retriever is None:
+                raise RuntimeError("混合检索器未初始化")
+            results = await self.hybrid_retriever.search(
+                query, k, session_id, persona_id
+            )
+
+        # 异步更新访问时间(不阻塞返回)
+        for result in results:
+            self._create_tracked_task(self._update_access_time_internal(result.doc_id))
+
+        return results
+
+    async def get_memory(self, memory_id: int) -> dict[str, Any] | None:
+        """
+        根据ID获取记忆
+
+        Args:
+            memory_id: 记忆ID
+
+        Returns:
+            Optional[Dict]: 记忆数据,包含text和metadata
+        """
+        # 从faiss_db的document_storage获取文档
+        try:
+            # 使用 get_documents (复数) 并传入 ids 参数
+            docs = await self.faiss_db.document_storage.get_documents(
+                metadata_filters={}, ids=[memory_id], limit=1
+            )
+
+            if not docs or len(docs) == 0:
+                return None
+
+            doc = docs[0]
+            return {
+                "id": doc["id"],
+                "text": doc["text"],
+                "metadata": doc["metadata"],
+            }
+        except Exception:
+            return None
+
+    async def update_memory(
+        self,
+        memory_id: int,
+        updates: dict[str, Any],
+    ) -> bool:
+        """
+        更新记忆（确保多数据库同步）
+
+        支持更新内容、重要性、元数据等。采用不同策略：
+        - 内容更新：先创建后删除（避免数据丢失）+ 全库同步
+        - 元数据更新：三库同步更新
+
+        Args:
+            memory_id: 记忆ID
+            updates: 更新字典,可包含:
+                - content: 新内容 (触发完整重建)
+                - importance: 新重要性
+                - metadata: 元数据更新
+
+        Returns:
+            bool: 是否更新成功
+        """
+        # 获取当前记忆
+        memory = await self.get_memory(memory_id)
+        if not memory:
+            logger.error(f"[更新] 记忆不存在 (memory_id={memory_id})")
+            return False
+
+        # 解析 metadata（可能是JSON字符串）
+        current_metadata = memory.get("metadata", {})
+        if isinstance(current_metadata, str):
+            import json
+
+            try:
+                current_metadata = json.loads(current_metadata)
+            except (json.JSONDecodeError, TypeError):
+                current_metadata = {}
+        elif not isinstance(current_metadata, dict):
+            current_metadata = {}
+
+        # 处理内容更新 (需要重建所有索引)
+        if "content" in updates:
+            new_content = updates["content"]
+            if not new_content or not new_content.strip():
+                return False
+
+            try:
+                # 保留必要信息
+                session_id = current_metadata.get("session_id")
+                persona_id = current_metadata.get("persona_id")
+                importance = current_metadata.get(
+                    "importance", updates.get("importance", 0.5)
+                )
+
+                # 构建新元数据
+                new_metadata = current_metadata.copy()
+                new_metadata["updated_at"] = time.time()
+                new_metadata["previous_id"] = memory_id  # 记录旧ID
+
+                # 【改进】先创建新记忆，再删除旧记忆（避免数据丢失）
+                logger.info(f"[更新] 开始内容更新流程 (old_id={memory_id})")
+
+                # 1. 创建新记忆（自动在所有数据库创建）
+                new_memory_id = await self.add_memory(
+                    content=new_content,
+                    session_id=session_id,
+                    persona_id=persona_id,
+                    importance=importance,
+                    metadata=new_metadata,
+                )
+
+                if new_memory_id is None:
+                    logger.error(f"[更新] 创建新记忆失败 (old_id={memory_id})")
+                    return False
+
+                logger.info(f"[更新] 新记忆已创建 (new_id={new_memory_id})")
+
+                # 2. 删除旧记忆（从所有数据库删除）
+                delete_success = await self.delete_memory(memory_id)
+                if not delete_success:
+                    # 旧记忆删除失败，回滚：删除刚创建的新记忆，避免重复记录
+                    logger.warning(
+                        f"[更新] 删除旧记忆失败，回滚新记忆 (old_id={memory_id}, new_id={new_memory_id})"
+                    )
+                    await self.delete_memory(new_memory_id)
+                    return False
+
+                logger.info(
+                    f"[更新] 内容更新完成 (old_id={memory_id} → new_id={new_memory_id})"
+                )
+                return True
+
+            except Exception as e:
+                logger.error(
+                    f"[更新] 内容更新失败 (memory_id={memory_id}): {e}", exc_info=True
+                )
+                return False
+
+        # 处理非内容的元数据更新（不需要重建索引）
+        metadata_updates = {}
+
+        if "importance" in updates:
+            metadata_updates["importance"] = max(0.0, min(1.0, updates["importance"]))
+
+        if "metadata" in updates:
+            metadata_updates.update(updates["metadata"])
+
+        if metadata_updates:
+            # 确保 current_metadata 是字典（再次检查）
+            if not isinstance(current_metadata, dict):
+                import json
+
+                try:
+                    current_metadata = (
+                        json.loads(current_metadata)
+                        if isinstance(current_metadata, str)
+                        else {}
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    current_metadata = {}
+
+            # 合并元数据
+            current_metadata.update(metadata_updates)
+            current_metadata["updated_at"] = time.time()
+
+            # 【改进】使用增强的update_metadata确保三库同步
+            if self.hybrid_retriever is None:
+                logger.error("混合检索器未初始化")
+                return False
+            success = await self.hybrid_retriever.update_metadata(
+                memory_id, metadata_updates
+            )
+
+            if success:
+                logger.info(f"[更新] 元数据更新成功 (memory_id={memory_id})")
+                if self.graph_memory_manager is not None:
+                    await self.graph_memory_manager.index_memory(
+                        memory_id,
+                        memory["text"],
+                        current_metadata,
+                    )
+            else:
+                logger.error(f"[更新] 元数据更新失败 (memory_id={memory_id})")
+
+            return success
+
+        return True
+
+    async def delete_memory(self, memory_id: int) -> bool:
+        """
+        删除记忆
+
+        Args:
+            memory_id: 记忆ID
+
+        Returns:
+            bool: 是否删除成功
+        """
+
+        # hybrid_retriever.delete_memory() 内部已按顺序删除 BM25、向量索引和 documents 表
+        if self.hybrid_retriever is None:
+            logger.error("混合检索器未初始化")
+            return False
+        success = await self.hybrid_retriever.delete_memory(memory_id)
+        if success and self.graph_memory_manager is not None:
+            await self.graph_memory_manager.delete_memory(memory_id)
+        return success
+
+    async def rebuild_graph_index(self) -> dict[str, int]:
+        """Rebuild graph-memory artifacts from stored documents."""
+        if self.graph_memory_manager is None:
+            return {"rebuilt": 0, "skipped": 0}
+
+        total_count = await self.faiss_db.document_storage.count_documents(
+            metadata_filters={}
+        )
+        batch_size = 200
+        offset = 0
+        rebuilt = 0
+        skipped = 0
+
+        while offset < total_count:
+            docs = await self.faiss_db.document_storage.get_documents(
+                metadata_filters={},
+                limit=batch_size,
+                offset=offset,
+            )
+            if not docs:
+                break
+
+            for doc in docs:
+                metadata = doc.get("metadata") or {}
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (json.JSONDecodeError, TypeError):
+                        metadata = {}
+                elif not isinstance(metadata, dict):
+                    metadata = {}
+                content = str(doc.get("text") or "")
+                if not content.strip():
+                    skipped += 1
+                    continue
+                await self.graph_memory_manager.index_memory(
+                    doc["id"], content, metadata
+                )
+                rebuilt += 1
+
+            offset += batch_size
+
+        return {"rebuilt": rebuilt, "skipped": skipped}
+
+    # ==================== 高级功能 ====================
+
+    async def update_importance(self, memory_id: int, new_importance: float) -> bool:
+        """
+        更新记忆重要性
+
+        Args:
+            memory_id: 记忆ID
+            new_importance: 新重要性值(0-1)
+
+        Returns:
+            bool: 是否更新成功
+        """
+        return await self.update_memory(memory_id, {"importance": new_importance})
+
+    async def apply_daily_decay(self, decay_rate: float, days: int = 1) -> int:
+        """
+        批量应用重要性衰减
+
+        Args:
+            decay_rate: 每日衰减率 (0-1)
+            days: 衰减天数（用于补偿错过的天数）
+
+        Returns:
+            int: 受影响的记忆数量
+        """
+        if decay_rate <= 0 or days <= 0:
+            return 0
+
+        if self.db_connection is None:
+            logger.error("[衰减] 数据库连接未初始化")
+            return 0
+
+        try:
+            # 计算衰减因子：(1 - decay_rate) ^ days
+            decay_factor = (1 - decay_rate) ** days
+
+            # PostgreSQL: 使用 jsonb 操作符
+            cursor = await self.db_connection.execute(
+                """
+                UPDATE documents
+                SET metadata = metadata::jsonb || jsonb_build_object(
+                    'importance',
+                    GREATEST(0.01, ROUND(
+                        COALESCE(
+                            (metadata::jsonb->>'importance')::numeric,
+                            0.5
+                        ) * $1,
+                        4
+                    ))
+                )
+                WHERE (metadata::jsonb->>'importance') IS NOT NULL
+                   OR metadata::text LIKE '%"importance"%'
+                """,
+                (decay_factor,),
+            )
+
+            await self.db_connection.commit()
+            affected = cursor.rowcount
+
+            logger.info(
+                f"[衰减] 批量衰减完成: 衰减率={decay_rate}, 天数={days}, "
+                f"衰减因子={decay_factor:.4f}, 影响记录={affected}"
+            )
+
+            return affected
+
+        except Exception as e:
+            logger.error(f"[衰减] 批量衰减失败: {e}", exc_info=True)
+            return 0
+
+    async def update_access_time(self, memory_id: int) -> bool:
+        """
+        更新最后访问时间
+
+        Args:
+            memory_id: 记忆ID
+
+        Returns:
+            bool: 是否更新成功
+        """
+        return await self._update_access_time_internal(memory_id)
+
+    async def _update_access_time_internal(self, memory_id: int) -> bool:
+        """内部方法:更新访问时间（直接更新documents表）"""
+        import json
+
+        current_time = time.time()
+
+        try:
+            if self.db_connection is None:
+                return False
+
+            # PostgreSQL: 使用 jsonb_set 原子更新
+            await self.db_connection.execute(
+                "UPDATE documents SET metadata = jsonb_set(metadata::jsonb, '{last_access_time}', $1::jsonb) WHERE id = $2",
+                (json.dumps(current_time), memory_id),
+            )
+            return True
+
+        except Exception as e:
+            logger.debug(f"更新访问时间失败 (memory_id={memory_id}): {e}")
+            return False
+
+    async def get_session_memories(
+        self,
+        session_id: str,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """
+        获取会话的所有记忆（使用分批处理和数据库排序优化）
+
+        Args:
+            session_id: 会话ID(应传入完整的unified_msg_origin格式)
+            limit: 限制数量
+
+        Returns:
+            List[Dict]: 记忆列表
+        """
+        # 【关键修改】不再提取UUID，直接使用完整的session_id进行匹配
+        # 因为现在数据库中存储的就是完整的unified_msg_origin格式
+
+        # 使用数据库层面的排序和分页，避免加载所有数据
+        try:
+
+            # 先获取总数判断是否需要分批
+            total_count = await self.faiss_db.document_storage.count_documents(
+                metadata_filters={"session_id": session_id}
+            )
+
+            if total_count == 0:
+                return []
+
+            # 如果总数小于等于limit，直接一次性获取
+            if total_count <= limit:
+                all_docs = await self.faiss_db.document_storage.get_documents(
+                    metadata_filters={"session_id": session_id},
+                    limit=limit,
+                    offset=0,
+                )
+                # 通过线程池批量规范化 metadata（避免大量 json.loads 阻塞事件循环）
+                all_docs = await asyncio.to_thread(
+                    self._normalize_batch_metadata, all_docs
+                )
+                sorted_docs = sorted(
+                    all_docs,
+                    key=lambda d: float(
+                        d.get("metadata", {}).get("create_time", 0)
+                    ),
+                    reverse=True,
+                )
+            else:
+                all_docs = []
+                batch_size = 500
+                offset = 0
+
+                while offset < total_count:
+                    batch = await self.faiss_db.document_storage.get_documents(
+                        metadata_filters={"session_id": session_id},
+                        limit=batch_size,
+                        offset=offset,
+                    )
+
+                    if not batch:
+                        break
+
+                    batch = await asyncio.to_thread(
+                        self._normalize_batch_metadata, batch
+                    )
+                    all_docs.extend(batch)
+                    offset += batch_size
+
+                sorted_docs = sorted(
+                    all_docs,
+                    key=lambda d: float(
+                        d.get("metadata", {}).get("create_time", 0)
+                    ),
+                    reverse=True,
+                )[:limit]
+
+            memories = []
+            for doc in sorted_docs:
+                memories.append(
+                    {
+                        "id": doc["id"],
+                        "text": doc["text"],
+                        "metadata": doc["metadata"],
+                    }
+                )
+
+            return memories
+        except Exception:
+            return []
+
+    async def _execute_with_retry(self, coro_factory, description: str, max_retries: int = 3):
+        """Execute a database operation with retry on lock errors."""
+        import sqlite3 as _sqlite3
+        for attempt in range(max_retries):
+            try:
+                return await coro_factory()
+            except (_sqlite3.OperationalError, Exception) as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    logger.warning(
+                        f"[批量删除] {description} 遇到数据库锁，{wait}s 后重试 "
+                        f"({attempt + 1}/{max_retries})"
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    raise
+
+    async def batch_delete_memories(self, memory_ids: list[int]) -> int:
+        """Batch delete multiple memories using bulk SQL operations."""
+        if not memory_ids:
+            return 0
+
+        if self.db_connection is None:
+            logger.error("[批量删除] 数据库连接未初始化")
+            return 0
+
+        total_deleted = 0
+        sql_batch_size = 200
+
+        for i in range(0, len(memory_ids), sql_batch_size):
+            batch = memory_ids[i : i + sql_batch_size]
+            placeholders = ",".join("?" * len(batch))
+
+            # 1. Batch delete from BM25 FTS
+            await self._execute_with_retry(
+                lambda: self.db_connection.execute(
+                    f"DELETE FROM ama10_memories_fts WHERE doc_id IN ({placeholders})",
+                    batch,
+                ),
+                "FTS 删除",
+            )
+
+            # 2. Look up UUIDs and delete from FAISS vector DB
+            cursor = await self._execute_with_retry(
+                lambda: self.db_connection.execute(
+                    f"SELECT id, doc_id FROM documents WHERE id IN ({placeholders})",
+                    batch,
+                ),
+                "UUID 查询",
+            )
+            uuid_rows = await cursor.fetchall()
+            for row in uuid_rows:
+                uuid_doc_id = row["doc_id"]
+                if uuid_doc_id:
+                    try:
+                        await self.faiss_db.delete(uuid_doc_id)
+                    except Exception:
+                        logger.debug(
+                            f"[批量删除] FAISS 删除失败 (id={row['id']})",
+                            exc_info=True,
+                        )
+
+            # 3. Batch delete from documents table
+            await self._execute_with_retry(
+                lambda: self.db_connection.execute(
+                    f"DELETE FROM documents WHERE id IN ({placeholders})",
+                    batch,
+                ),
+                "documents 删除",
+            )
+            await self._execute_with_retry(
+                lambda: self.db_connection.commit(),
+                "事务提交",
+            )
+
+            # 4. Batch delete graph artifacts
+            if self.graph_memory_manager is not None:
+                await self.graph_memory_manager.batch_delete_memories(batch)
+
+            total_deleted += len(batch)
+
+        if total_deleted:
+            logger.info(f"[批量删除] 共删除 {total_deleted} 条记忆")
+        return total_deleted
+
+    async def cleanup_old_memories(
+        self,
+        days_threshold: int | None = None,
+        importance_threshold: float | None = None,
+    ) -> int:
+        """
+        清理旧记忆（使用分批处理避免内存问题）
+
+        删除超过阈值且重要性低的记忆
+
+        Args:
+            days_threshold: 天数阈值,默认从配置读取
+            importance_threshold: 重要性阈值,默认从配置读取
+
+        Returns:
+            int: 删除的记忆数量
+        """
+        # 使用配置或参数值
+        days = (
+            self.config.get("cleanup_days_threshold", 30)
+            if days_threshold is None
+            else days_threshold
+        )
+        importance = (
+            self.config.get("cleanup_importance_threshold", 0.3)
+            if importance_threshold is None
+            else importance_threshold
+        )
+        try:
+            days = int(days)
+            importance = float(importance)
+        except (TypeError, ValueError):
+            logger.error(
+                f"清理参数格式错误: days_threshold={days}, importance_threshold={importance}"
+            )
+            return 0
+
+        if days < 0:
+            logger.error(f"清理参数无效: days_threshold={days}（必须 >= 0）")
+            return 0
+
+        cutoff_time = time.time() - (days * 86400)
+
+        # 分批扫描文档并删除，避免一次性加载所有数据到内存
+        try:
+            # 先获取总数
+            total_count = await self.faiss_db.document_storage.count_documents(
+                metadata_filters={}
+            )
+
+            if total_count == 0:
+                return 0
+
+            batch_size = 500
+            offset = 0
+            to_delete_ids: list[int] = []
+
+            # First pass: scan candidates without deleting to avoid offset-shift skips.
+            while offset < total_count:
+                batch_docs = await self.faiss_db.document_storage.get_documents(
+                    metadata_filters={}, limit=batch_size, offset=offset
+                )
+
+                if not batch_docs:
+                    break
+
+                batch_docs = await asyncio.to_thread(
+                    self._normalize_batch_metadata, batch_docs
+                )
+
+                for doc in batch_docs:
+                    metadata = doc["metadata"]
+
+                    create_time = metadata.get("create_time", time.time())
+                    doc_importance = metadata.get("importance", 0.5)
+
+                    # 确保时间值是数字类型
+                    try:
+                        create_time = float(create_time)
+                        doc_importance = float(doc_importance)
+                    except (ValueError, TypeError):
+                        continue
+
+                    if create_time < cutoff_time and doc_importance < importance:
+                        to_delete_ids.append(doc["id"])
+
+                offset += len(batch_docs)
+                if len(batch_docs) < batch_size:
+                    break
+
+            if not to_delete_ids:
+                return 0
+
+            logger.info(
+                f"[清理] 发现 {len(to_delete_ids)} 条候选记忆，开始批量删除"
+            )
+            deleted_count = await self.batch_delete_memories(to_delete_ids)
+            logger.info(f"[清理] 完成，已删除 {deleted_count} 条旧记忆")
+
+            return deleted_count
+        except Exception:
+            return 0
+
+    async def _migrate_session_data_if_needed(self, unified_msg_origin: str) -> None:
+        """
+        运行时自动迁移：将旧格式的session_id更新为unified_msg_origin格式
+
+        PG 模式下跳过 — 数据已由迁移脚本一次性处理。
+
+        支持各种平台的旧格式（通用匹配策略）：
+        - WebChat UUID: "ac8c2cef-959e-4146-ad22-c82d0230ad06"
+        - WebChat带前缀: "webchat!astrbot!ac8c2cef-959e-4146-ad22-c82d0230ad06"
+        - QQ号: "123456789"
+        - 其他平台: 任意字符串
+
+        目标格式: "platform:message_type:session_id"
+
+        策略：
+        1. 从unified_msg_origin解析出：platform、message_type、session_id
+        2. 生成所有可能的旧格式匹配候选（递归拆分）
+        3. 查找匹配任一候选且不含冒号的旧记录
+        4. 批量更新为unified_msg_origin
+        5. 使用unified_msg_origin本身作为迁移标记（避免重复）
+
+        Args:
+            unified_msg_origin: 完整的统一消息来源（格式：platform:type:session_id）
+        """
+        return  # PG 模式下数据已由迁移脚本处理，跳过运行时迁移
+
+        try:
+            # 1. 解析 unified_msg_origin
+            parts = unified_msg_origin.split(":", 2)
+            if len(parts) != 3:
+                logger.warning(
+                    f"[自动迁移] unified_msg_origin 格式不正确: {unified_msg_origin}"
+                )
+                return
+
+            platform_id, message_type, full_session_id = parts
+
+            # 2. 生成所有可能的旧格式匹配候选
+            # 对于 "webchat!astrbot!ac8c2cef-..." 会生成:
+            #   ["webchat!astrbot!ac8c2cef-...", "astrbot!ac8c2cef-...", "ac8c2cef-..."]
+            # 对于 "123456789" 会生成: ["123456789"]
+            candidates = [full_session_id]
+
+            # 按感叹号递归拆分
+            if "!" in full_session_id:
+                parts_by_bang = full_session_id.split("!")
+                for i in range(1, len(parts_by_bang)):
+                    candidates.append("!".join(parts_by_bang[i:]))
+
+            logger.info(f"[自动迁移] 开始检查会话，候选匹配: {candidates}")
+
+            # 3. 检查是否已迁移（使用unified_msg_origin本身作为标记）
+            migration_key = f"migrated_umo_{unified_msg_origin}"
+            if self.db_connection is None:
+                return
+            cursor = await self.db_connection.execute(
+                "SELECT value FROM migration_status WHERE key = ?", (migration_key,)
+            )
+            row = await cursor.fetchone()
+            if row and row[0] == "true":
+                # 已迁移过，跳过
+                return
+
+            # 4. 查找所有需要迁移的记录
+            # 条件：session_id 匹配任一候选 且 不包含冒号（旧格式标识）
+            placeholders = " OR ".join(
+                ["json_extract(metadata, '$.session_id') = ?" for _ in candidates]
+            )
+            query = f"""
+                SELECT id, metadata FROM documents
+                WHERE ({placeholders})
+                AND json_extract(metadata, '$.session_id') NOT LIKE '%:%'
+            """
+
+            cursor = await self.db_connection.execute(query, tuple(candidates))
+            rows = list(await cursor.fetchall())
+
+            if not rows:
+                logger.info("[自动迁移] 未找到需要迁移的旧数据")
+                # 即使没有旧数据也标记为已检查，避免重复查询
+                await self.db_connection.execute(
+                    "INSERT OR REPLACE INTO migration_status (key, value, updated_at) VALUES (?, ?, datetime('now'))",
+                    (migration_key, "true"),
+                )
+                await self.db_connection.commit()
+                return
+
+            logger.info(f"[自动迁移] 找到 {len(list(rows))} 条旧数据需要迁移")
+
+            # 5. 批量更新
+            updated_count = 0
+            for row in rows:
+                doc_id = row[0]
+                metadata_str = row[1]
+
+                try:
+                    metadata = json.loads(metadata_str) if metadata_str else {}
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
+
+                old_session_id = metadata.get("session_id", "unknown")
+
+                # 更新为unified_msg_origin格式
+                metadata["session_id"] = unified_msg_origin
+                metadata["migrated_at"] = time.time()
+                metadata["old_session_id"] = old_session_id  # 保留旧值便于追溯
+
+                # 写回数据库
+                await self.db_connection.execute(
+                    "UPDATE documents SET metadata = ? WHERE id = ?",
+                    (json.dumps(metadata, ensure_ascii=False), doc_id),
+                )
+                updated_count += 1
+
+            # 6. 提交更新
+            await self.db_connection.commit()
+
+            # 7. 标记为已迁移
+            await self.db_connection.execute(
+                "INSERT OR REPLACE INTO migration_status (key, value, updated_at) VALUES (?, ?, datetime('now'))",
+                (migration_key, "true"),
+            )
+            await self.db_connection.commit()
+
+            logger.info(
+                f"[自动迁移] 完成！已更新 {updated_count} 条记录 -> {unified_msg_origin}"
+            )
+
+        except Exception as e:
+            logger.error(f"[自动迁移] 迁移失败: {e}", exc_info=True)
+
+    async def get_statistics(self) -> dict[str, Any]:
+        """
+        获取记忆统计信息（使用批量处理避免内存问题）
+
+        Returns:
+            Dict: 统计信息,包含:
+                - total_memories: 总记忆数
+                - sessions: 各会话的记忆数（按UUID分组）
+                - status_breakdown: 各状态的记忆数
+                - avg_importance: 平均重要性
+                - oldest_memory: 最旧记忆时间
+                - newest_memory: 最新记忆时间
+        """
+        try:
+            # 使用 count_documents() 高效获取总数（不加载数据）
+            total_count = await self.faiss_db.document_storage.count_documents(
+                metadata_filters={}
+            )
+
+            stats = {}
+            stats["total_memories"] = total_count
+
+            # 初始化统计变量
+            session_counts: dict[str, int] = {}
+            status_breakdown = {"active": 0, "archived": 0, "deleted": 0}
+            importance_sum = 0
+            importance_count = 0
+            oldest_time = None
+            newest_time = None
+
+            # 分批处理，每次加载500条，避免内存问题
+            batch_size = 500
+            offset = 0
+
+            while offset < total_count:
+                # 获取一批文档
+                batch_docs = await self.faiss_db.document_storage.get_documents(
+                    metadata_filters={}, limit=batch_size, offset=offset
+                )
+
+                if not batch_docs:
+                    break
+
+                # 通过线程池批量规范化 metadata（避免大量 json.loads 阻塞事件循环）
+                batch_docs = await asyncio.to_thread(
+                    self._normalize_batch_metadata, batch_docs
+                )
+
+                for doc in batch_docs:
+                    metadata = doc["metadata"]
+
+                    # 统计会话（直接使用session_id分组）
+                    session_id = metadata.get("session_id")
+                    if session_id:
+                        session_counts[session_id] = (
+                            session_counts.get(session_id, 0) + 1
+                        )
+
+                    # 统计状态（默认 active）
+                    status = metadata.get("status", "active")
+                    if status in status_breakdown:
+                        status_breakdown[status] += 1
+                    else:
+                        # 未知状态默认计入 active
+                        status_breakdown["active"] += 1
+
+                    # 统计重要性
+                    importance = metadata.get("importance")
+                    if importance is not None:
+                        try:
+                            importance = float(importance)
+                            importance_sum += importance
+                            importance_count += 1
+                        except (ValueError, TypeError):
+                            pass
+
+                    # 统计时间
+                    create_time = metadata.get("create_time")
+                    if create_time:
+                        try:
+                            create_time = float(create_time)
+                            if oldest_time is None or create_time < oldest_time:
+                                oldest_time = create_time
+                            if newest_time is None or create_time > newest_time:
+                                newest_time = create_time
+                        except (ValueError, TypeError):
+                            pass
+
+                # 移动到下一批
+                offset += batch_size
+
+            stats["sessions"] = session_counts
+            stats["status_breakdown"] = status_breakdown
+            stats["avg_importance"] = (
+                importance_sum / importance_count if importance_count > 0 else 0.0
+            )
+            stats["oldest_memory"] = oldest_time
+            stats["newest_memory"] = newest_time
+            if self.graph_store is not None:
+                stats.update(await self.graph_store.get_memory_entry_stats())
+                stats["graph_memory_enabled"] = True
+            else:
+                stats["graph_memory_enabled"] = False
+
+            return stats
+        except Exception as e:
+            logger.error(f"获取统计信息失败: {e}", exc_info=True)
+            return {
+                "total_memories": 0,
+                "sessions": {},
+                "status_breakdown": {"active": 0, "archived": 0, "deleted": 0},
+                "avg_importance": 0.0,
+                "oldest_memory": None,
+                "newest_memory": None,
+                "graph_memory_enabled": bool(self.graph_store is not None),
+            }
+
+    @staticmethod
+    def _normalize_batch_metadata(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Normalize metadata from JSON strings to dicts for a batch of documents.
+
+        Offloaded to thread pool in batch processing paths to avoid blocking
+        the event loop with hundreds of json.loads calls.
+        """
+        for doc in docs:
+            metadata = doc.get("metadata")
+            if isinstance(metadata, str):
+                try:
+                    doc["metadata"] = json.loads(metadata)
+                except (json.JSONDecodeError, TypeError):
+                    doc["metadata"] = {}
+            elif not isinstance(metadata, dict):
+                doc["metadata"] = {}
+        return docs
