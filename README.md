@@ -20,6 +20,11 @@
 
 ## 📦 安装
 
+### 前置要求
+
+- AstrBot >= 4.24.2
+- PostgreSQL >= 14 with pgvector 扩展
+
 ### 方式一：AstrBot 插件市场
 
 在 AstrBot 插件页面搜索 `AMA-10 Memory` 安装。
@@ -36,7 +41,15 @@ git clone https://github.com/preca-hoshino/astrbot_plugin_ama-10_memory.git astr
 ### 依赖
 
 ```bash
-pip install networkx jieba pytz aiofiles aiosqlite asyncpg
+pip install networkx jieba pytz aiofiles asyncpg
+```
+
+### PostgreSQL 配置
+
+本插件**仅支持 PostgreSQL** (需要 pgvector 扩展)。安装 pgvector：
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
 ```
 
 ## 🔧 配置
@@ -45,8 +58,7 @@ pip install networkx jieba pytz aiofiles aiosqlite asyncpg
 
 | 配置项 | 说明 | 默认值 |
 |--------|------|--------|
-| `database_settings.backend` | 存储后端 (`""` = SQLite, `"pg"` = PostgreSQL) | `""` |
-| `database_settings.pg_dsn` | PostgreSQL 连接 URL | `""` |
+| `database_settings.pg_dsn` | PostgreSQL 连接 URL | `""` (必填) |
 | `provider_settings.llm_provider_id` | 记忆摘要用的 LLM 模型 ID | (AstrBot 默认) |
 | `provider_settings.embedding_provider_id` | 向量化用的 Embedding 模型 ID | (AstrBot 默认) |
 | `session_manager.*` | 会话管理配置 | — |
@@ -88,6 +100,14 @@ pip install networkx jieba pytz aiofiles aiosqlite asyncpg
 
 ```
 main.py                     # 插件入口
+storage/                    # PostgreSQL 存储层
+├── pg_connection.py        # PG 连接池管理
+├── pg_adapter.py           # asyncpg 兼容适配器
+├── pg_vec_db.py            # pgvector 向量数据库
+├── graph_store.py          # 图记忆存储
+├── atom_store.py           # Atom 存储
+├── conversation_store.py   # 会话存储
+└── db_migration.py         # 数据库迁移
 core/
 ├── base/                   # 基础配置、常量、异常
 ├── managers/
