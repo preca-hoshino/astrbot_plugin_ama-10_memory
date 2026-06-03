@@ -142,11 +142,11 @@ core/
 
 ## 📋 从 LivingMemory 迁移
 
-如果你正在使用 `lxfight/astrbot_plugin_livingmemory`，迁移到 AMA-10 Memory 需要注意：
+如果你正在使用 `lxfight/astrbot_plugin_livingmemory`：
 
-1. **数据库不兼容** — AMA-10 Memory 使用 `ama_10_memory.db` 等新文件名，旧数据不会自动迁移
-2. **手动迁移** — 如需保留旧数据，可将 `livingmemory.db` 重命名为 `ama_10_memory.db`（表结构兼容）
-3. **配置** — 配置格式基本兼容，但插件名称已更改
+1. **PostgreSQL 数据完全兼容** — 所有内部表名、字段名与原插件 100% 一致，无需任何数据库迁移
+2. **配置文件** — 插件名称已更改为 `astrbot_plugin_ama_10_memory`，配置文件名会自动变化
+3. **直接替换** — 停用旧插件，启用 AMA-10 Memory，配置 `pg_dsn` 即可
 
 ## 🙏 致谢
 

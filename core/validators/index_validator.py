@@ -53,13 +53,12 @@ class IndexValidator:
     DEFAULT_MAX_FAILURE_RATIO = 0.02
 
     async def _clear_bm25_with_retry(
-        self, table_name: str = "ama_10_memories_fts", max_attempts: int = 5
+        self, table_name: str = "livingmemory_memories_fts", max_attempts: int = 5
     ) -> None:
         """清空 BM25 索引表，不触碰 documents 原始数据。"""
         for attempt in range(max_attempts):
             try:
                 async with PgContextManager(get_pool()) as db:
-                    await db.execute("PRAGMA busy_timeout = 10000")
                     try:
                         await db.execute(f"DELETE FROM {table_name}")
                     except Exception as e:
@@ -97,22 +96,21 @@ class IndexValidator:
                 cursor = await db.execute("SELECT id FROM documents")
                 doc_ids = {row[0] for row in await cursor.fetchall()}
 
-                # 2. 检查BM25索引（ama_10_memories_fts表）
+                # 2. 检查BM25索引（livingmemory_memories_fts表）
                 cursor = await db.execute("""
-                    SELECT tablename AS name FROM pg_tables WHERE schemaname = 'public'
-                    WHERE type='table' AND name='ama_10_memories_fts'
+                    SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename = 'livingmemory_memories_fts'
                 """)
                 has_fts_table = await cursor.fetchone()
 
                 if has_fts_table:
                     cursor = await db.execute(
-                        "SELECT COUNT(DISTINCT doc_id) FROM ama_10_memories_fts"
+                        "SELECT COUNT(DISTINCT doc_id) FROM livingmemory_memories_fts"
                     )
                     bm25_result = await cursor.fetchone()
                     bm25_count = bm25_result[0] if bm25_result else 0
 
                     cursor = await db.execute(
-                        "SELECT DISTINCT doc_id FROM ama_10_memories_fts"
+                        "SELECT DISTINCT doc_id FROM livingmemory_memories_fts"
                     )
                     bm25_ids = {row[0] for row in await cursor.fetchall()}
                 else:
@@ -202,8 +200,7 @@ class IndexValidator:
             async with PgContextManager(get_pool()) as db:
                 # 检查migration_status表
                 cursor = await db.execute("""
-                    SELECT tablename AS name FROM pg_tables WHERE schemaname = 'public'
-                    WHERE type='table' AND name='migration_status'
+                    SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename = 'migration_status'
                 """)
                 has_table = await cursor.fetchone()
 
@@ -331,7 +328,6 @@ class IndexValidator:
                 chunk = sorted_ids[start : start + batch_size]
                 placeholders = ",".join("?" for _ in chunk)
                 async with PgContextManager(get_pool()) as db:
-                    await db.execute("PRAGMA busy_timeout = 10000")
                     cursor = await db.execute(
                         f"""
                         SELECT id, doc_id, text, metadata
@@ -347,7 +343,6 @@ class IndexValidator:
         last_id = 0
         while True:
             async with PgContextManager(get_pool()) as db:
-                await db.execute("PRAGMA busy_timeout = 10000")
                 cursor = await db.execute(
                     """
                     SELECT id, doc_id, text, metadata
@@ -397,7 +392,7 @@ class IndexValidator:
         if text_processor is None:
             raise RuntimeError("无法重建 BM25：TextProcessor 未初始化")
 
-        table_name = getattr(bm25_retriever, "fts_table", "ama_10_memories_fts")
+        table_name = getattr(bm25_retriever, "fts_table", "livingmemory_memories_fts")
         batch_size = int(options["batch_size"])
         max_failure_ratio = float(options["max_failure_ratio"])
 
@@ -424,7 +419,6 @@ class IndexValidator:
             if rows_to_insert:
                 try:
                     async with PgContextManager(get_pool()) as db:
-                        await db.execute("PRAGMA busy_timeout = 10000")
                         await db.executemany(
                             f"INSERT INTO {table_name}(doc_id, content) VALUES (?, ?)",
                             rows_to_insert,
@@ -438,7 +432,6 @@ class IndexValidator:
                     for row_doc_id, processed_content in rows_to_insert:
                         try:
                             async with PgContextManager(get_pool()) as db:
-                                await db.execute("PRAGMA busy_timeout = 10000")
                                 await db.execute(
                                     f"INSERT INTO {table_name}(doc_id, content) VALUES (?, ?)",
                                     (row_doc_id, processed_content),
@@ -948,12 +941,10 @@ class IndexValidator:
         """
         try:
             async with PgContextManager(get_pool()) as db:
-                await db.execute("PRAGMA busy_timeout = 10000")
 
                 # 检查备份表是否存在
                 cursor = await db.execute("""
-                    SELECT tablename AS name FROM pg_tables WHERE schemaname = 'public'
-                    WHERE type='table' AND name='_documents_rebuild_backup'
+                    SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename = '_documents_rebuild_backup'
                 """)
                 if not await cursor.fetchone():
                     return

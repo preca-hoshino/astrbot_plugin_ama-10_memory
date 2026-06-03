@@ -49,7 +49,7 @@ class MemoryEngine:
        - 主键: id (INTEGER, BIGSERIAL)
 
     2. **BM25 索引**
-       - 表: ama_10_memories_fts (PostgreSQL tsvector)
+       - 表: livingmemory_memories_fts (PostgreSQL tsvector)
        - 由触发器自动更新 tsv 列
 
     插件对外接口：
@@ -813,7 +813,7 @@ class MemoryEngine:
             # 1. Batch delete from BM25 FTS
             await self._execute_with_retry(
                 lambda: self.db_connection.execute(
-                    f"DELETE FROM ama_10_memories_fts WHERE doc_id IN ({placeholders})",
+                    f"DELETE FROM livingmemory_memories_fts WHERE doc_id IN ({placeholders})",
                     batch,
                 ),
                 "FTS 删除",
