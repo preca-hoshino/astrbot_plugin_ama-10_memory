@@ -159,10 +159,10 @@ class MemoryEngine:
         logger.info("[MemoryEngine] HybridRetriever 初始化完成")
 
         if self.graph_enabled and self.graph_vector_db is not None:
-            self.graph_store = GraphStore()
+            self.graph_store = GraphStore("")
             await self.graph_store.initialize()
 
-            self.atom_store = AtomStore()
+            self.atom_store = AtomStore("")
             await self.atom_store.initialize()
 
             if self.atom_enabled:
@@ -1031,12 +1031,12 @@ class MemoryEngine:
             # 4. 查找所有需要迁移的记录
             # 条件：session_id 匹配任一候选 且 不包含冒号（旧格式标识）
             placeholders = " OR ".join(
-                ["json_extract(metadata, '$.session_id') = ?" for _ in candidates]
+                [f"metadata->>'session_id' = ${{i+1}}" for i in range(len(candidates))]
             )
             query = f"""
                 SELECT id, metadata FROM documents
                 WHERE ({placeholders})
-                AND json_extract(metadata, '$.session_id') NOT LIKE '%:%'
+                AND metadata->>'session_id' NOT LIKE '%:%'
             """
 
             cursor = await self.db_connection.execute(query, tuple(candidates))
@@ -1046,7 +1046,7 @@ class MemoryEngine:
                 logger.info("[自动迁移] 未找到需要迁移的旧数据")
                 # 即使没有旧数据也标记为已检查，避免重复查询
                 await self.db_connection.execute(
-                    "INSERT OR REPLACE INTO migration_status (key, value, updated_at) VALUES (?, ?, datetime('now'))",
+                    "INSERT INTO migration_status (key, value, updated_at) VALUES (?, ?, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at",
                     (migration_key, "true"),
                 )
                 await self.db_connection.commit()
@@ -1084,7 +1084,7 @@ class MemoryEngine:
 
             # 7. 标记为已迁移
             await self.db_connection.execute(
-                "INSERT OR REPLACE INTO migration_status (key, value, updated_at) VALUES (?, ?, datetime('now'))",
+                "INSERT INTO migration_status (key, value, updated_at) VALUES (?, ?, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at",
                 (migration_key, "true"),
             )
             await self.db_connection.commit()

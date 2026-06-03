@@ -98,7 +98,7 @@ class IndexValidator:
 
                 # 2. 检查BM25索引（livingmemory_memories_fts表）
                 cursor = await db.execute("""
-                    SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename = 'livingmemory_memories_fts'
+                    SELECT tablename FROM pg_tables WHERE schemaname = 'livingmemory' AND tablename = 'livingmemory_memories_fts'
                 """)
                 has_fts_table = await cursor.fetchone()
 
@@ -200,7 +200,7 @@ class IndexValidator:
             async with PgContextManager(get_pool()) as db:
                 # 检查migration_status表
                 cursor = await db.execute("""
-                    SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename = 'migration_status'
+                    SELECT tablename FROM pg_tables WHERE schemaname = 'livingmemory' AND tablename = 'migration_status'
                 """)
                 has_table = await cursor.fetchone()
 
@@ -724,8 +724,8 @@ class IndexValidator:
                 "partial": False,
             }
 
-        vector_ids = self._get_vector_ids()
-        vector_count = self._get_vector_count()
+        vector_ids = await self._get_vector_ids()
+        vector_count = await self._get_vector_count()
         if vector_ids is not None:
             missing_ids = document_ids - vector_ids
             if not missing_ids:
@@ -775,8 +775,9 @@ class IndexValidator:
                 """)
                 await status_db.execute(
                     """
-                    INSERT OR REPLACE INTO migration_status (key, value, updated_at)
+                    INSERT INTO migration_status (key, value, updated_at)
                     VALUES (?, ?, ?)
+                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at
                     """,
                     (
                         "needs_index_rebuild",
@@ -786,8 +787,9 @@ class IndexValidator:
                 )
                 await status_db.execute(
                     """
-                    INSERT OR REPLACE INTO migration_status (key, value, updated_at)
+                    INSERT INTO migration_status (key, value, updated_at)
                     VALUES (?, ?, ?)
+                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at
                     """,
                     (
                         "index_rebuild_completed",
@@ -944,7 +946,7 @@ class IndexValidator:
 
                 # 检查备份表是否存在
                 cursor = await db.execute("""
-                    SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename = '_documents_rebuild_backup'
+                    SELECT tablename FROM pg_tables WHERE schemaname = 'livingmemory' AND tablename = '_documents_rebuild_backup'
                 """)
                 if not await cursor.fetchone():
                     return

@@ -15,21 +15,47 @@ from astrbot.api import logger
 
 def _convert_placeholders(sql: str) -> str:
     """将 SQLite 的 ? 占位符转换为 PostgreSQL 的 $1, $2, ...
-    同时处理 INSERT OR IGNORE → INSERT ... ON CONFLICT DO NOTHING
+    同时处理:
+      - INSERT OR IGNORE → INSERT ... ON CONFLICT DO NOTHING
+      - INSERT OR REPLACE → INSERT ... ON CONFLICT (...) DO UPDATE SET ...
     """
+    was_insert_or_ignore = False
+
     # INSERT OR IGNORE → INSERT ... ON CONFLICT DO NOTHING
-    sql = re.sub(
-        r'\bINSERT\s+OR\s+IGNORE\s+INTO\b',
-        'INSERT INTO',
-        sql,
-        flags=re.IGNORECASE,
-    )
-    # 如果有 INSERT OR IGNORE 转换，且没有 ON CONFLICT，添加 DO NOTHING
-    if 'ON CONFLICT' not in sql.upper() and 'INSERT INTO' in sql.upper():
-        # 检查是否是 VALUES 语句（不是 SELECT ... INSERT）
-        if 'VALUES' in sql.upper() and 'INSERT INTO' in sql.upper():
-            # 不自动添加，因为不是所有 INSERT 都需要 ON CONFLICT
-            pass
+    if re.search(r'\bINSERT\s+OR\s+IGNORE\s+INTO\b', sql, flags=re.IGNORECASE):
+        was_insert_or_ignore = True
+        sql = re.sub(
+            r'\bINSERT\s+OR\s+IGNORE\s+INTO\b',
+            'INSERT INTO',
+            sql,
+            flags=re.IGNORECASE,
+        )
+
+    # INSERT OR REPLACE → INSERT INTO ... ON CONFLICT DO UPDATE
+    # 注意: 调用方应显式写 ON CONFLICT DO UPDATE SET ... 以指定更新列
+    # 这里只做基本的语法替换
+    if re.search(r'\bINSERT\s+OR\s+REPLACE\s+INTO\b', sql, flags=re.IGNORECASE):
+        sql = re.sub(
+            r'\bINSERT\s+OR\s+REPLACE\s+INTO\b',
+            'INSERT INTO',
+            sql,
+            flags=re.IGNORECASE,
+        )
+        # 如果没有显式 ON CONFLICT，追加基本的 DO UPDATE
+        if 'ON CONFLICT' not in sql.upper():
+            # 从 VALUES 子句前截断，追加 ON CONFLICT
+            # 匹配 VALUES (...) 然后追加
+            sql = re.sub(
+                r'(VALUES\s*\([^)]*\))\s*$',
+                r'\1 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at',
+                sql,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+
+    # INSERT OR IGNORE 追加 ON CONFLICT DO NOTHING
+    if was_insert_or_ignore and 'ON CONFLICT' not in sql.upper():
+        if 'VALUES' in sql.upper():
+            sql = sql.rstrip().rstrip(';') + ' ON CONFLICT DO NOTHING'
 
     counter = 0
     result = []

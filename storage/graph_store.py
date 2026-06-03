@@ -264,7 +264,7 @@ class GraphStore:
                 if node_id is None:
                     continue
                 await db.execute(
-                    "INSERT OR IGNORE INTO graph_entry_nodes(entry_id, node_id) VALUES (?, ?)",
+                    "INSERT INTO graph_entry_nodes(entry_id, node_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
                     (entry_id, node_id),
                 )
             await db.commit()
